@@ -878,7 +878,7 @@ class WithConfigurationDataValidator(Validator):
             )
 
         @log_execution
-        def safe_wrapper(corpus_document_data: dict, image_path: str) -> str:
+        def safe_wrapper(corpus_document_data: dict, image_path: str) -> pd.Series:
             """
             Run document validation with exception handling and OpsIQ reporting.
 
@@ -887,7 +887,9 @@ class WithConfigurationDataValidator(Validator):
                 image_path (str): Image path associated with the document.
 
             Returns:
-                str: "True" if valid, "False" if invalid, or error_value on error.
+                pd.Series: ("True"/"False", "True"/"False") or (error_value, error_value).
+                First value is flow decision (influenced by audit flag).
+                Second value is actual validation result.
             """
             try:
                 field_results = func(corpus_document_data, score_threshold)
@@ -899,31 +901,35 @@ class WithConfigurationDataValidator(Validator):
                         result["IsValid"] is False
                         for result in field_results
                     )
+
+                    # Actual validation status (ignoring audit flag)
+                    actual_validation_status = "False" if has_validation_errors else "True"
+
                     should_process = opsiq_audit_flag or has_validation_errors
 
                     if should_process:
                         build_and_send_opsiq_msg(
                             field_results, has_validation_errors, image_path
                         )
-                        return "False"
+                        return pd.Series(["False", actual_validation_status])
                     else:
                         log.info(
                             "\nAll the Keys inside the present image,\n"
                             "passed validation successfully...\n"
                         )
-                        return "True"
+                        return pd.Series(["True", actual_validation_status])
                 else:
-                    return error_value
+                    return pd.Series([error_value, error_value])
 
             except Exception as e:
                 log.info(f"Error in the 'validate_document()' function call:\n{str(e)}\n")
                 log.info(f"Error type: {type(e).__name__}\n")
                 # Possible Timestream call
-                return error_value
+                return pd.Series([error_value, error_value])
 
         log.info("Applying the validation functions to all the rows inside the table...\n")
 
-        df[new_col] = df[[source_col, image_col]].apply(
+        df[[new_col, "validation_passed"]] = df[[source_col, image_col]].apply(
             lambda x: safe_wrapper(safe_json_loads(x.iloc[0]), x.iloc[1]), axis=1
         )
         return df
@@ -1181,8 +1187,10 @@ class WithConfigurationDataValidator(Validator):
         tr_account_name = tr_account_name if tr_account_name is not None else "-"
         result_df.select("data_is_valid").distinct().show(vertical=True, truncate=False)
 
-        valid_count = result_df.filter(result_df.data_is_valid == "True").count()
-        invalid_count = result_df.filter(result_df.data_is_valid == "False").count()
+        # Using validation_passed column to count based on actual validation result
+        # ignoring if the item was audited (sent to OpsIQ) or not.
+        valid_count = result_df.filter(result_df.validation_passed == "True").count()
+        invalid_count = result_df.filter(result_df.validation_passed == "False").count()
 
         log.info(f"Records Written in the ValidateData Module: {final_record_count}")
         Onboarding_Timestream_Manager.timestream_insert_data(
