@@ -1,0 +1,47 @@
+{
+    "reference_data": {
+        "s3_path": "s3://my-reference-bucket/master-data/customers.csv",
+        "format": "csv",
+        "index_local_path": "/tmp/reference_index",
+        "schema": [
+            {"name": "customer_id", "type": "ID", "stored": true},
+            {"name": "first_name", "type": "TEXT", "stored": true},
+            {"name": "last_name", "type": "TEXT", "stored": true},
+            {"name": "phone", "type": "TEXT", "stored": true},
+            {"name": "email", "type": "TEXT", "stored": true},
+            {"name": "address", "type": "TEXT", "stored": true}
+        ]
+    },
+    "matching_rules": {
+        "blocking_strategy": {
+            "method": "whoosh",
+            "search_fields": ["first_name", "last_name", "phone", "email"],
+            "top_k_candidates": 10
+        },
+        "scoring": {
+            "method": "weighted_average",
+            "threshold": 0.85,
+            "attributes": [
+                {
+                    "field": "first_name",
+                    "weight": 0.3,
+                    "algo": "sequence_matcher"
+                },
+                {
+                    "field": "last_name",
+                    "weight": 0.3,
+                    "algo": "sequence_matcher"
+                },
+                {
+                    "field": "phone",
+                    "weight": 0.4,
+                    "algo": "exact"
+                }
+            ]
+        }
+    },
+    "output": {
+        "success_action": "route_downstream",
+        "failure_action": "route_to_opsiq"
+    }
+}
