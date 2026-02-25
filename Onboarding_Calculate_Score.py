@@ -10,6 +10,7 @@ import boto3
 import textwrap
 import time
 import os
+import numpy as np
 from awsglue.utils import getResolvedOptions
 from Onboarding_Glue_Job_Base import GlueJobBase, JobVariables, WorkflowParams
 from abc import ABC, abstractmethod
@@ -298,14 +299,24 @@ class WithConfigurationScorer(Scorer):
 
     @log_execution
     def pd_to_spark(self, pd_df: pd.DataFrame) -> DataFrame:
+        # Convert all to string to be safe, except score/status if needed
+        # Or rely on Spark inference.
         # Using string for simplicity as per template
         schema_cols = []
         for col in pd_df.columns:
             schema_cols.append(StructField(col, StringType(), True))
 
         schema = StructType(schema_cols)
-        # Convert non-string cols to string for consistency
-        pd_df = pd_df.astype(str)
+
+        # Replace NaN/None with explicit None to ensure they are treated as nulls in Spark,
+        # instead of casting 'nan' or 'None' strings.
+        pd_df = pd_df.replace({np.nan: None})
+
+        # Convert to string ONLY where value is not None, preserving None
+        # Since astype(str) converts None to 'None', we must handle carefully.
+        # Map values to str if not None.
+        pd_df = pd_df.applymap(lambda x: str(x) if x is not None else None)
+
         return self.spark.createDataFrame(pd_df, schema=schema)
 
     @staticmethod
@@ -580,9 +591,6 @@ class GlueJobExecution(GlueJobBase):
                 job_vars.enrichment_catalog_table,
             )
 
-            # Using args directly since JobVariables might not map custom args automatically
-            # Unless we modify JobVariables, which we can't see/edit here.
-            # Assuming we can access args dictionary or extend JobVariables conceptually.
             # Accessing from 'args' dict directly for new params
             reference_catalog_data = GlueCatalog(
                 args.get('ReferenceCatalogDB'),
