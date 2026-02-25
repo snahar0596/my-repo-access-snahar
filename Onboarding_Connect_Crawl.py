@@ -1,236 +1,1051 @@
 import importlib
 import sys
-import boto3
 import zipfile
 import io
 import os
-import ast
-import Onboarding_Log_Manager
-import Onboarding_Timestream_Manager
 import pandas as pd
-from pyspark.sql import DataFrame
-from pyspark.context import SparkContext
-from pyspark.sql.types import StringType
-from pyspark.sql.functions import lit
-from awsglue.context import GlueContext
-from awsglue.job import Job
+import requests
+import logging
+import re
+import uuid
+import hashlib
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import StringType, StructType, StructField
+from pyspark.sql import functions as F
 from awsglue.utils import getResolvedOptions
 from datetime import datetime
 from botocore.exceptions import ClientError
-from Onboarding_Configuration_Template import S3Location, GlueCatalog
-from Onboarding_Metadata_Extractor import TRCredentials, FactoryMetadataExtractor
-from logging import Logger
+from Onboarding_Configuration_Template import S3Location, GlueCatalog, ConfigurationTemplate
+from Onboarding_Glue_Job_Base import GlueJobBase, JobVariables, WorkflowParams
+from abc import ABC, abstractmethod
+from botocore.client import BaseClient
+from Onboarding_OpsIQ_Manager import OpsIQMessageManager
+from functools import wraps
+from Onboarding_Timestream_Manager import (
+    timestream_insert_data,
+    create_timestream_content,
+    create_timestream_failure_content
+)
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', 200)
 
 
-class JobVariables:
-    def __init__(self, args: dict):
-        """
-        Parse and store job-level variables passed to the Glue job.
-
-        Args:
-            args (dict): Dictionary containing job arguments provided at
-                runtime, including workflow, catalog, and TR settings.
-
-        Returns:
-            None
-        """
-        self.job_name = args["JOB_NAME"]
-        self.workflow_name = args["WORKFLOW_NAME"]
-        self.workflow_run_id = args["WORKFLOW_RUN_ID"]
-        self.catalog_db = args["CatalogDB"]
-        self.incoming_catalog_table = args["IncomingCatalogTable"]
-        self.timestream_db = args["TimestreamDB"]
-        self.timestream_table = args["TimestreamTable"]
-        self.timestream_sqs_queue = args["TimestreamSQSQueue"]
-        self.regionName = args["RegionName"]
-        self.tr_base_api = args["BaseTRApi"]
-        self.trSecretManagerName = args["TRSecretManagerName"]
-        self.decompressedFolder = args["DecompressedFolder"]
-        self.opsiq_queue = args.get("OpsIQQueue", None)
-
-    def __repr__(self) -> str:
-        """
-        Return a human-readable representation of the job variables.
-
-        Args:
-            None
-
-        Returns:
-            str: Multiline string containing key job configuration values.
-        """
-        return (
-            f"job_name: '{self.job_name}'\n"
-            f"workflow_name: '{self.workflow_name}'\n"
-            f"workflow_run_id: '{self.workflow_run_id}'\n"
-            f"catalog_db: '{self.catalog_db}'\n"
-            f"incoming_catalog_table: '{self.incoming_catalog_table}'\n"
-            f"timestream_db: '{self.timestream_db}'\n"
-            f"timestream_table: '{self.timestream_table}'\n"
-            f"timestream_sqs_queue: '{self.timestream_sqs_queue}'\n"
-        )
-    
-
-class WorkflowParams:
-    def __init__(self, workflow_params: dict, log: Logger):
-        """
-        Parse and store workflow parameters passed to the Glue workflow run.
-
-        Args:
-            workflow_params (dict): Dictionary containing workflow runtime
-                parameters such as source, zip key, and transaction id.
-            log (Logger): Logger instance used to emit workflow-related logs.
-
-        Returns:
-            None
-        """
-        self.log = log
-        self.transaction_id = workflow_params["transaction_id"]
-        self.source = workflow_params["source"]
-        self.incoming_bucket = workflow_params["incoming_bucket"]
-        self.source_device = workflow_params["source_device"]
-        
-        # 1. Parse filter parameters first
-        self.filter_parameters = self.get_filter_parameters(workflow_params)
-
-        # 2. Extract raw zip_key
-        raw_zip_key = workflow_params["zip_key"]
-        
-        # 3. Derive batch name (needed for looking up specific batch config)
-        # Note: Logic assumes batch name is the filename without extension
-        self.batch_name = raw_zip_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-
-        # 4. Normalize zip_key (Handle missing prefix)
-        self.zip_key = self.normalize_zip_key(raw_zip_key)
-
-    def get_filter_parameters(self, workflow_params: dict) -> dict:
-        """
-        Extract and parse filter parameters from workflow parameters.
-
-        Args:
-            workflow_params (dict): Dictionary containing workflow runtime
-                parameters.
-
-        Returns:
-            dict: Parsed filter parameters or empty dict if not present.
-        """
-        filter_params_str = workflow_params.get("filter_parameters", None)
-        if not filter_params_str:
-            return {}
-        
+def log_execution(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        logging.info(f"Starting the execution of {func.__name__} function\n")
         try:
-            return ast.literal_eval(filter_params_str)
-        except (ValueError, SyntaxError):
-            self.log.warning(f"Failed to parse filter_parameters: {filter_params_str}")
-            return {}
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            logging.info(f"Finishing the execution of {func.__name__} function\n")
+    return wrapper
 
-    def normalize_zip_key(self, raw_zip_key: str) -> str:
+
+class TRCredentials():
+    def __init__(
+        self,
+        tr_secret_keys: dict,
+        tr_base_api: str
+    ) -> None:
         """
-        Ensure the zip_key has the correct prefix path.
-        If the key has no slashes, it tries to find a prefix in filter_parameters
-        or defaults to 'radix-onboarding-indexed/'.
+        Initialize credentials required to authenticate against the TR API.
 
         Args:
-            raw_zip_key (str): The zip key string from workflow params.
+            tr_secret_keys (dict): Dictionary containing authentication keys
+                such as grant type, username, and password.
+            tr_base_api (str): Base URL of the TR API.
 
         Returns:
-            str: The normalized zip key with a path prefix.
+            None
         """
-        if "/" in raw_zip_key:
-            return raw_zip_key
-        
-        self.log.info(f"Detected zip_key without path: '{raw_zip_key}'. Attempting to normalize.")
+        self.tr_grant_type = tr_secret_keys.get("grant_type", "")
+        self.tr_username = tr_secret_keys.get("username", "")
+        self.tr_password = tr_secret_keys.get("password", "")
+        self.tr_base_api = tr_base_api
 
-        # Try to find a specific prefix in the filter params for this batch
-        prefix = None
-        if self.filter_parameters:
-            # Check if there is a 'zip_key_prefix' at the top level
-            prefix = self.filter_parameters.get("zip_key_prefix")
-            
-            # If not, check inside the specific batch config
-            if not prefix and self.batch_name in self.filter_parameters:
-                batch_config = self.filter_parameters[self.batch_name]
-                prefix = batch_config.get("zip_key_prefix")
 
-        # Fallback default if no prefix found
-        if not prefix:
-            prefix = "radix-onboarding-indexed/"
-            self.log.info("No 'zip_key_prefix' found in parameters. Using default: 'radix-onboarding-indexed/'")
-        else:
-            self.log.info(f"Using configured 'zip_key_prefix': '{prefix}'")
+class MetadataExtractor(ABC):
+    @abstractmethod
+    def extract_metadata(self, location: S3Location):
+        pass
 
-        # Ensure prefix ends with a slash
-        if not prefix.endswith("/"):
-            prefix += "/"
-            
-        normalized_key = f"{prefix}{raw_zip_key}"
-        self.log.info(f"Normalized zip_key: '{normalized_key}'")
-        return normalized_key
 
-    def __repr__(self) -> str:
+class CsvNoItemExtractor(MetadataExtractor):
+    def __init__(
+        self,
+        source_file_name : str,
+        source: str,
+        location: S3Location,
+        tr_credentials: TRCredentials,
+        s3_client: BaseClient,
+        glue_client: BaseClient,
+        spark: SparkSession,
+        batch_name: str,
+        transaction_id: str,
+        workflow_name: str,
+        workflow_run_id: str,
+        opsiq_queue: str = None,
+        filter_parameters: dict = None,
+        timestream_config: dict = None,
+    ):
         """
-        Return a human-readable representation of the workflow parameters.
+        Initialize a CSV metadata extractor for batches without item records.
+
+        Args:
+            source_file_name (str): Source identifier for the incoming data.
+            source (str): Source identifier for the the pipeline.
+            location (S3Location): S3 bucket/prefix where loadfile.csv lives.
+            tr_credentials (TRCredentials): Credentials used to call TR APIs.
+            s3_client (BaseClient): Boto3 S3 client used to read S3 objects.
+            glue_client (BaseClient): Boto3 Glue client to set workflow props.
+            spark (SparkSession): Spark session used to build Spark DataFrames.
+            batch_name (str): Batch identifier for the incoming data.
+            transaction_id (str): Transaction identifier for the batch.
+            workflow_name (str): Glue workflow name to update run properties.
+            workflow_run_id (str): Glue workflow run id to update properties.
+            filter_parameters (dict): Optional filter parameters to update data.
+            timestream_config (dict): Timestream settings for error logging.
+
+        Returns:
+            None
+        """
+        super().__init__()
+        self.source_file_name = source_file_name
+        self.source = source
+        self.bucket_name = location.bucket
+        self.target_prefix = location.prefix
+        self.s3_client = s3_client
+        self.glue_client = glue_client
+        self.loadfile_path = (
+            f"s3://{self.bucket_name}/{self.target_prefix}loadfile.csv"
+        )
+        self.batch_name = batch_name
+        self.transaction_id = transaction_id
+        self.tr_credentials = tr_credentials
+        self.spark = spark
+        self.workflow_name = workflow_name
+        self.workflow_run_id = workflow_run_id
+        self.opsiq_queue = opsiq_queue
+        self.filter_parameters = filter_parameters
+        self.timestream_config = timestream_config
+
+    @log_execution
+    def load_file_exists(self) -> bool:
+        """
+        Check whether loadfile.csv exists under the configured S3 prefix.
 
         Args:
             None
 
         Returns:
-            str: Multiline string describing the workflow parameters.
+            bool: True if loadfile.csv exists in S3, otherwise False.
         """
-        return (
-            f"transaction_id: '{self.transaction_id}'\n"
-            f"source: '{self.source}'\n"
-            f"zip_key: '{self.zip_key}'\n"
-            f"incoming_bucket: '{self.incoming_bucket}'\n"
-            f"source_device: '{self.source_device}'\n"
+        load_file_key = self.target_prefix + "loadfile.csv"
+        try:
+            self.s3_client.get_object(Bucket=self.bucket_name, Key=load_file_key)
+            logging.info(f"loadfile.csv exist in: {self.loadfile_path}")
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                message = f"The object '{load_file_key}' was not found."
+            else:
+                message = f"Unexpected error occurred: {e}"
+            logging.error(f"{message}")
+            return False
+        except Exception as e:
+            logging.error(f"An error occurred while checking for loadfile.csv: {e}")
+            return False
+
+    @log_execution
+    def apply_filter_parameters(self, loadfile_df: pd.DataFrame) -> None:
+        """
+        Apply filter parameters to update the DataFrame in place.
+
+        Args:
+            loadfile_df (pd.DataFrame): The DataFrame to update.
+
+        Returns:
+            None
+        """
+        if not self.filter_parameters:
+            return
+
+        batch_params = self.filter_parameters.get(self.batch_name)
+        if not batch_params:
+            logging.info(f"No filter parameters found for batch: {self.batch_name}")
+            return
+
+        box_barcode = batch_params.get("box_barcode")
+        if box_barcode:
+            logging.info(f"Updating Box Barcode to '{box_barcode}' from filter parameters.")
+            loadfile_df["Box Barcode"] = box_barcode
+
+    @log_execution
+    def read_csv_loadfile(self) -> pd.DataFrame:
+        """
+        Read loadfile.csv from S3 into a Pandas DataFrame.
+
+        Args:
+            None
+
+        Returns:
+            pd.DataFrame: DataFrame containing the parsed CSV content.
+
+        Raises:
+            ValueError: If the resulting DataFrame is empty.
+        """
+        logging.info(
+            "The incoming data to process is:\n"
             f"batch_name: '{self.batch_name}'\n"
-            f"filter_parameters: '{self.filter_parameters}'\n"
+            f"transaction_id: '{self.transaction_id}'\n"
+            f"loadfile_path: '{self.loadfile_path}'\n\n"
+            "Reading the CSV file..."
         )
 
-    def get_batch_name(self) -> str:
+        loadfile_df = pd.read_csv(
+            self.loadfile_path,
+            dtype=str,
+            sep="|",
+            quotechar='"',
+            escapechar="~",
+            doublequote=True,
+            on_bad_lines="warn",
+        )
+
+        frame_shape = loadfile_df.shape
+
+        logging.info(
+            f"Successfully read data!\n\n"
+            f"Shape for input frame:\n{frame_shape}\n\n"
+            f"First 10 rows:\n{loadfile_df.head(10).to_string()}\n\n"
+            f"Input types:\n{loadfile_df.dtypes}\n"
+            f"Original columns:\n{loadfile_df.columns.tolist()}\n\n"
+            "Checking if the Pandas Dataframe is empty or not..."
+        )
+
+        if loadfile_df.empty:
+            raise ValueError("¡No data to write or DataFrame is empty or invalid!")
+
+        logging.info("Pandas Dataframe is not empty.")
+        return loadfile_df
+
+    @log_execution
+    def ensure_uniqueness(self, loadfile_df: pd.DataFrame) -> tuple[str, str, str]:
         """
-        Derive the batch name from the zip file key.
-        (Deprecated/Redundant: Logic moved to __init__ but kept for compatibility if needed)
+        Validate batch-level uniqueness constraints in the loadfile DataFrame.
+
+        Args:
+            loadfile_df (pd.DataFrame): Input DataFrame read from loadfile.csv.
+
+        Returns:
+            tuple: (box_barcode, tr_account_name, collection_name) derived from the input data.
+        """
+        box_barcode_list = loadfile_df["Box Barcode"].unique().tolist()
+        tr_account_name = loadfile_df["Collection"].unique().tolist()[0]
+        collection_name = loadfile_df["Project"].unique().tolist()[0]
+
+        if len(box_barcode_list) != 1:
+            message = "Multiple Box Barcodes present in the batch"
+            logging.error(message)
+            exit(message)
+
+        box_barcode = box_barcode_list[0]
+        logging.info(
+            f"Box Barcode is: {box_barcode}\n"
+            f"TR Customer Name is: {tr_account_name}\n"
+            f"Project Name is: {collection_name}"
+        )
+        return box_barcode, tr_account_name, collection_name
+
+    @log_execution
+    def get_customer_config(self, tr_account_name: str) -> dict:
+        """
+        Retrieve the TR customer configuration file for a given account name.
+
+        Args:
+            tr_account_name (str): TR account name used to locate the config.
+
+        Returns:
+            dict: Parsed customer configuration for the TR account.
+        """
+        location = S3Location(
+            bucket=self.bucket_name,
+            prefix="Onb_Customer_Conf/",
+            key=f"{tr_account_name}",
+        )
+        customer_config = ConfigurationTemplate.get_tr_account_config_file(
+            location
+        )
+        logging.info(f"Customer configuration for '{tr_account_name}': {customer_config}")
+        return customer_config
+
+    @log_execution
+    def create_tr_access_token(self):
+        """
+        Create an OAuth access token for authenticating TR API requests.
 
         Args:
             None
 
         Returns:
-            str: Batch name extracted from the zip file name.
-        """
-        return self.batch_name
+            str: Access token to be used in the Authorization header.
 
-    def get_target_prefix(self, decompressed_folder: str) -> str:
+        Raises:
+            Exception: If the token creation request fails.
         """
-        Build the target S3 prefix for the decompressed batch contents.
+        create_access_token_api = (
+            f"https://{self.tr_credentials.tr_base_api}/Token"
+        )
+        headers = {"Content-Type": "application/json"}
+        token_payload = {
+            "grant_type": self.tr_credentials.tr_grant_type,
+            "username": self.tr_credentials.tr_username,
+            "password": self.tr_credentials.tr_password,
+        }
+        logging.info(create_access_token_api)
+        res = requests.post(
+            create_access_token_api, data=token_payload, headers=headers
+        )
+        if res.status_code != 200:
+            message = f"Failed to create TR access token: {res.text}"
+            logging.error(message)
+            raise Exception(message)
+        tr_access_token = res.json()["access_token"]
+        return tr_access_token
+
+    @log_execution
+    def get_tr_box_parent_id(
+        self,
+        tr_customer_id: str,
+        box_barcode: str,
+        tr_access_token: str
+    ) -> bool:
+        """
+        Check whether a box barcode exists for a given TR customer via TR API.
 
         Args:
-            decompressed_folder (str): Root folder used for decompressed data.
+            tr_customer_id (str): TR customer id used to query TR items.
+            box_barcode (str): Box barcode to validate for the customer.
+            tr_access_token (str): Bearer token used to authenticate the call.
 
         Returns:
-            str: Target S3 prefix where extracted files will be written.
+            bool: True if the box barcode is valid, otherwise False.
         """
-        zip_path = self.zip_key.rsplit("/", 1)[0]
-        self.log.info(f"zip_path: '{zip_path}'")
-
-        path_parts = zip_path.split("/", 1)
-        self.log.info(f"Initial value for 'path_parts' path: '{path_parts}'")
-
-        path_parts[0] = decompressed_folder
-        self.log.info(f"Final value for 'path_parts' path: '{path_parts}'")
-
-        target_prefix = (
-            "/".join(path_parts) + "/" + self.batch_name + "/"
+        logging.info("Calling the TR API to check if the Box Barcode exists for the TR Customer")
+        get_parent_id_api = (
+            f"https://{self.tr_credentials.tr_base_api}/api/v1.0/Items/"
+            f"{tr_customer_id}/{box_barcode}/GetItemByItemCode"
         )
-        self.log.info(f"target_prefix: '{target_prefix}'")
+        headers = {
+            "Authorization": f"Bearer {tr_access_token}",
+            "Content-Type": "application/json",
+        }
+        res = requests.get(get_parent_id_api, headers=headers)
+        if res.status_code == 200:
+            logging.info("Valid Box Barcode for TR Customer")
+            return True
+        if res.status_code == 404:
+            logging.info("Invalid Box Barcode for TR Customer")
+            return False
+        logging.info(f"Error while calling the API: {res.json}")
+        return False
 
-        return target_prefix
+    @log_execution
+    def validate_box_barcode(self, box_barcode: str, tr_customer_id: str):
+        """
+        Validate a box barcode for a TR customer by calling TR APIs.
 
-    
+        Args:
+            box_barcode (str): Box barcode to validate.
+            tr_customer_id (str): TR customer id used to query TR items.
 
-class GlueJobExecution:
+        Returns:
+            bool: True if the box barcode is valid, otherwise False.
+        """
+        logging.info("Creating Token to call TR APIs")
+        tr_access_token = self.create_tr_access_token()
+        logging.info("Access Token Created")
+        return self.get_tr_box_parent_id(
+            tr_customer_id, box_barcode, tr_access_token
+        )
+
+    @staticmethod
+    @log_execution
+    def convert_columns_to_snake_case(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert all column names in a pandas DataFrame to snake_case.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame whose columns are renamed.
+
+        Returns:
+            pd.DataFrame: DataFrame with renamed columns in snake_case.
+        """
+
+        def to_snake_case(name: str) -> str:
+            # Remove "(Auto Extracted)" (case-insensitive)
+            name = re.sub(
+                r"\s*\(Auto Extracted\)\s*",
+                " ",
+                name,
+                flags=re.IGNORECASE,
+            )
+
+            # Handle camelCase and PascalCase
+            name = re.sub(r"([a-z])([A-Z])", r"\1_\2", name)
+            name = re.sub(r"([A-Z])([a-z])", r"_\1\2", name)
+
+            # Replace separators with underscore
+            name = re.sub(r"[\s\-.]+", "_", name)
+
+            # Normalize
+            name = name.lower().strip("_")
+            name = re.sub(r"_+", "_", name)
+
+            return name
+
+        logging.info("Converting column names to snake case...")
+        return df.rename(columns={col: to_snake_case(col) for col in df.columns})
+
+    @log_execution
+    def process_loadfile_df(self, loadfile_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize and enrich the loadfile DataFrame prior to Spark conversion.
+
+        Args:
+            loadfile_df (pd.DataFrame): Raw DataFrame read from loadfile.csv.
+
+        Returns:
+            pd.DataFrame: Processed DataFrame with added columns and cleaned
+                values.
+        """
+        loadfile_df = CsvNoItemExtractor.convert_columns_to_snake_case(loadfile_df)
+        logging.info(f"Snake converted columns:\n{loadfile_df.columns.tolist()}")
+
+        loadfile_df = loadfile_df.fillna("null")
+        loadfile_df["transaction_id"] = self.transaction_id
+        loadfile_df["batch_name"] = self.batch_name
+        loadfile_df["image_path"] = (
+            self.target_prefix
+            + loadfile_df["image_path"].str.replace("\\", "/")
+        )
+        loadfile_df["tr_customer_id"] = ""
+        loadfile_df["item_code"] = ""
+        loadfile_df["item_code_id"] = ""
+
+        logging.info(
+            "N/A filled with 'null' and colums 'transaction_id' and 'batch_name' created.\n"
+            "'target_prefix' added to the path inside the 'image_path' column.\n"
+            "'tr_customer_id', 'item_code', 'item_code_id' added to enforce schema"
+        )
+        return loadfile_df
+
+    @log_execution
+    def build_spark_df(self, loadfile_df: pd.DataFrame) -> DataFrame:
+        """
+        Create a Spark DataFrame with a string schema from a Pandas DataFrame.
+
+        Args:
+            loadfile_df (pd.DataFrame): Processed Pandas DataFrame.
+
+        Returns:
+            DataFrame: Spark DataFrame with all fields cast as StringType.
+        """
+        logging.info(
+            f"Building Spark DataFrame from Pandas DataFrame. Size: {loadfile_df.shape}"
+        )
+        all_columns = loadfile_df.columns.tolist()
+        schema = StructType(
+            [
+                StructField(column_name, StringType(), nullable=True)
+                for column_name in all_columns
+            ]
+        )
+        df_spark = self.spark.createDataFrame(loadfile_df, schema=schema)
+
+        logging.info("Spark Dataframe created.")
+
+        return df_spark
+
+    @F.pandas_udf(StringType())
+    def create_uuid_from_string(val_series: pd.Series) -> pd.Series:
+        """
+        Create deterministic UUID strings from an input series of strings.
+
+        Args:
+            val_series (pd.Series): Series of strings to hash into UUIDs.
+
+        Returns:
+            pd.Series: Series of UUID strings derived from the input strings.
+        """
+        return val_series.apply(
+            lambda val: str(
+                uuid.UUID(hex=hashlib.md5(val.encode("UTF-8")).hexdigest())
+            )
+        )
+
+    @staticmethod
+    @log_execution
+    def create_customer_filebarcode(df_spark: DataFrame) -> DataFrame:
+        """
+        Ensure the 'ref1' field is populated using a deterministic UUID.
+
+        Args:
+            df_spark (DataFrame): Spark DataFrame containing ref fields.
+
+        Returns:
+            DataFrame: Spark DataFrame with 'ref1' filled when missing and
+                intermediate columns dropped.
+        """
+        df_spark = (
+            df_spark.withColumn(
+                "ref1GUIDstr",
+                F.concat(
+                    F.col("batch_name"),
+                    F.lit("_"),
+                    F.col("image_path"),
+                    F.lit("_"),
+                    F.col("image_filename"),
+                ),
+            )
+            .withColumn(
+                "ref1GUID",
+                CsvNoItemExtractor.create_uuid_from_string(F.col("ref1GUIDstr")),
+            )
+            .withColumn(
+                "ref1",
+                F.when(F.col("ref1") == "null", F.col("ref1GUID")).otherwise(
+                    F.col("ref1")
+                ),
+            )
+            .drop("ref1GUIDstr", "ref1GUID")
+        )
+        return df_spark
+
+    @log_execution
+    def no_valid_box_barcode(
+        self,
+        collection_name: str,
+        box_barcode: str,
+        tr_account_name: str,
+        tr_customer_id: str,
+    ) -> None:
+        """
+        Handle the case where a box barcode is invalid for a given collection.
+
+        This method builds and sends a failure message to OpsIQ indicating that
+        the provided box barcode did not pass validation for the collection.
+        It also logs the failure to Timestream.
+
+        Args:
+            customer_config (dict): Customer-level configuration used to resolve
+                collection-specific rules and templates.
+            collection_name (str): Name of the collection being processed.
+            box_barcode (str): Box barcode that failed validation.
+            tr_account_name (str): TR Account Name for error logging.
+            tr_customer_id (str): TR Customer ID for error logging.
+
+        Returns:
+            None
+        """
+
+        FieldSchema = [
+            {
+                "FieldName": "collection_name",
+                "AlternativeLabels": [],
+                "FieldLabel": "Collection Name",
+                "Type": "string",
+                "Validation": {
+                    "MinLength": "",
+                    "MaxLength": "",
+                    "Pattern": "",
+                    "AllowSpecialChars": 'false',
+                    "AllowNull": 'false'
+                }
+            },            
+            {
+                "FieldName": "box_barcode",
+                "AlternativeLabels": [],
+                "FieldLabel": "Box Barcode",
+                "Type": "string",
+                "Validation": {
+                    "MinLength": "",
+                    "MaxLength": "",
+                    "Pattern": "",
+                    "AllowSpecialChars": 'false',
+                    "AllowNull": 'false'
+                }
+            }                      
+        ]
+
+        opsiq_message_manager = OpsIQMessageManager(
+            opsiq_queue=self.opsiq_queue,
+            batch_name=self.batch_name,
+            field_schema=FieldSchema,
+            transaction_id=self.transaction_id,
+            system="opsiq",
+            source=self.source,
+            source_bucket=self.bucket_name,
+            config_template=dict(),
+        )
+
+        FieldList = [
+            {
+                "FieldName": "collection_name",
+                "ValueScanned": collection_name,
+                "IsValid": 'true'
+            },
+            {
+                "FieldName": "box_barcode",
+                "ValueScanned": box_barcode,
+                "IsValid": 'false'
+            }
+        ]
+        
+        opsiq_message_manager.save_item_message_content(
+            ItemCode=box_barcode,
+            Status="Failed",
+            Error="Invalid Box Barcode",
+            ErrorCode="74",
+            EventName="BoxBarcodeValidation",
+            FieldList=FieldList,
+            DocumentImages=[],
+        )
+
+        opsiq_message_manager.send_opsiq_message()
+
+        if self.timestream_config:
+            error = (
+                f"Customer ID and Box Barcode Combination is not valid for TR Account Name:\n"
+                f"{tr_account_name}"
+            )
+            logging.error(error)
+            error_code = "74"
+            record_count = "0"
+
+            content = create_timestream_failure_content(
+                source=self.source,
+                source_device=self.timestream_config["source_device"],
+                tr_customer_id=str(tr_customer_id) if tr_customer_id is not None else "-",
+                transaction_id=self.transaction_id,
+                batch_name=self.batch_name,
+                item_code=box_barcode,
+                error=error,
+                error_code=error_code,
+                pipeline_mod=self.timestream_config["module"],
+                event_name="BoxBarcodeValidation",
+                record_count=record_count,
+            )
+
+            timestream_insert_data(
+                db=self.timestream_config["db"],
+                table=self.timestream_config["table"],
+                timestream_queue=self.timestream_config["queue"],
+                measure_name=f'OnboardingWF_{self.timestream_config["module"]}',
+                content=content
+            )
+
+    @log_execution
+    def log_valid_box_barcode_to_timestream(
+        self,
+        box_barcode: str,
+        tr_customer_id: str,
+    ) -> None:
+        """
+        Log a success event to Timestream when the box barcode is valid.
+
+        Args:
+            box_barcode (str): Box barcode that passed validation.
+            tr_account_name (str): TR Account Name.
+            tr_customer_id (str): TR Customer ID.
+
+        Returns:
+            None
+        """
+        if self.timestream_config:
+
+            content = create_timestream_content(
+                source=self.source,
+                source_device=self.timestream_config["source_device"],
+                tr_customer_id=str(tr_customer_id) if tr_customer_id is not None else "-",
+                transaction_id=self.transaction_id,
+                batch_name=self.batch_name,
+                item_code=box_barcode,
+                pipeline_mod=self.timestream_config["module"],
+                event_name="BoxBarcodeValidation",
+                state="Complete",
+                no_of_asset="1"
+            )
+
+            logging.info(f"Logging valid box barcode '{box_barcode}' to Timestream.")
+            timestream_insert_data(
+                db=self.timestream_config["db"],
+                table=self.timestream_config["table"],
+                timestream_queue=self.timestream_config["queue"],
+                measure_name=f'OnboardingWF_{self.timestream_config["module"]}',
+                content=content
+            )
+
+    @log_execution
+    def extract_metadata(self, location: S3Location) -> DataFrame:
+        """
+        Extract and validate metadata from loadfile.csv and return a Spark DF.
+
+        Args:
+            location (S3Location): S3 location that identifies the CSV source.
+
+        Returns:
+            DataFrame: Processed Spark DataFrame ready for downstream steps.
+
+        Raises:
+            FileNotFoundError: If loadfile.csv does not exist in S3.
+            ValueError: If the input is empty or the box barcode is invalid.
+        """
+        logging.info(f"Extracting metadata from CSV source: {location.prefix}")
+        exists = self.load_file_exists()
+        if not exists:
+            raise FileNotFoundError(
+                "loadfile.csv not found in "
+                f"s3://{self.bucket_name}/{self.target_prefix}"
+            )
+        loadfile_df = self.read_csv_loadfile()
+        self.apply_filter_parameters(loadfile_df)
+
+        with pd.option_context(
+            'display.max_columns', None,
+            'display.max_rows', None,
+            'display.width', None,
+            'display.max_colwidth', None
+        ):
+            print(loadfile_df.head(5))  # Limits to 10 rows, context removes truncation
+
+        box_barcode, tr_account_name, collection_name = self.ensure_uniqueness(loadfile_df)
+        customer_config = self.get_customer_config(tr_account_name)
+        tr_customer_id = customer_config["tr_customer_id"]
+        is_valid_box_barcode = self.validate_box_barcode(
+            box_barcode, tr_customer_id
+        )
+  
+        if is_valid_box_barcode:
+            self.log_valid_box_barcode_to_timestream(
+                box_barcode, tr_customer_id
+            )
+
+        if not is_valid_box_barcode:
+            self.no_valid_box_barcode(
+                collection_name,
+                box_barcode,
+                tr_account_name,
+                tr_customer_id
+            )
+            exit(f"Invalid Box Barcode '{box_barcode}' for TR Customer '{tr_account_name}'")
+
+        processed_loadfile_df = self.process_loadfile_df(loadfile_df)
+        spark_df = self.build_spark_df(processed_loadfile_df)
+        processed_spark_df = CsvNoItemExtractor.create_customer_filebarcode(
+            spark_df
+        )
+        self.glue_client.put_workflow_run_properties(
+            Name=self.workflow_name,
+            RunId=self.workflow_run_id,
+            RunProperties={"tr_account_name": tr_account_name},
+        )
+        return processed_spark_df
+
+
+class PerImageExtractor(MetadataExtractor):
+    def __init__(
+        self,
+        location: S3Location,
+        glue_catalog: GlueCatalog,
+        s3_client: BaseClient,
+        glue_client: BaseClient,
+        spark: SparkSession,
+        batch_name: str,
+        transaction_id: str,
+    ):
+        """
+        Initialize a per-image metadata extractor for image-based ingestion.
+
+        Args:
+            location (S3Location): S3 location containing image objects.
+            glue_catalog (GlueCatalog): Glue catalog database and table info.
+            s3_client (BaseClient): Boto3 S3 client to list and read objects.
+            glue_client (BaseClient): Boto3 Glue client to query table schema.
+            spark (SparkSession): Spark session used to build DataFrames.
+            batch_name (str): Batch identifier derived from the file key.
+            transaction_id (str): Transaction identifier for the ingestion.
+
+        Returns:
+            None
+        """
+        super().__init__()
+        self.location = location
+        self.s3_client = s3_client
+        self.glue_client = glue_client
+        self.batch_name = batch_name
+        self.transaction_id = transaction_id
+        self.spark = spark
+        self.glue_catalog = glue_catalog
+        self.file_key_parts = batch_name.split("_")
+        self.collection = self.file_key_parts[1]
+        self.project = self.file_key_parts[2]
+        self.tr_ocr_column = self.file_key_parts[3].split('.')[0].upper()
+
+    @log_execution
+    def get_objects_at_prefix(self) -> list[dict]:
+        """
+        List S3 objects available under the configured prefix.
+
+        Args:
+            None
+
+        Returns:
+            list[dict]: List of S3 paginator pages containing object metadata.
+        """
+        paginator = self.s3_client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(
+            Bucket=self.location.bucket,
+            Prefix=f"{self.location.prefix}",
+        )
+
+        filtered_pages = [page for page in pages if "Contents" in page]
+        return filtered_pages
+
+    @log_execution
+    def get_glue_table_schema(
+        self,
+        glue_client,
+        glue_catalog: GlueCatalog
+    ) -> list:
+        """
+        Retrieve the ordered column schema for a Glue catalog table.
+
+        Args:
+            glue_client (BaseClient): Boto3 Glue client instance.
+            glue_catalog (GlueCatalog): Glue catalog database and table info.
+
+        Returns:
+            list: Ordered list of column names from the Glue table schema.
+        """
+        try:
+            logging.info(
+                "Fetching schema for table: "
+                f"'{glue_catalog.catalog_db}.{glue_catalog.catalog_table}'"
+            )
+
+            response = glue_client.get_table(
+                DatabaseName=glue_catalog.catalog_db,
+                Name=glue_catalog.catalog_table,
+            )
+            columns = response["Table"]["StorageDescriptor"]["Columns"]
+            partition_keys = response["Table"].get("PartitionKeys", [])
+            ordered_columns = [_col["Name"] for _col in columns] + [p["Name"] for p in partition_keys]
+
+            logging.info(
+                "Retrieved Glue schema order for table \n"
+                f"'{glue_catalog.catalog_db}.{glue_catalog.catalog_table}':\n"
+                f"{ordered_columns}"
+            )
+            return ordered_columns
+
+        except Exception as e:
+            logging.error(
+                "Critical error in the 'get_glue_table_schema' function for the table\n"
+                f"'{glue_catalog.catalog_db}.{glue_catalog.catalog_table}':\n{str(e)}\n"
+                f"Error type: {type(e).__name__}"
+            )
+            exit("ConnectCrawl - Critical error")
+
+    @log_execution
+    def process_image(self, image_path: str) -> tuple:
+        """
+        Extract metadata fields from a single image object key.
+
+        Args:
+            image_path (str): Full S3 object key of the image file.
+
+        Returns:
+            tuple: Tuple containing extracted metadata fields, or an empty
+                tuple if the file extension is not supported.
+        """
+        if not image_path.lower().endswith(("tif", "jpeg", "jpg", "png", "tiff")):
+            return ()
+
+        img_key = image_path.split("/")[-1]
+        img_key_parts = img_key.split("_")
+        tr_customer_id = img_key_parts[0]
+        item_code = img_key_parts[1]
+        item_code_id = img_key_parts[2]
+
+        now = datetime.now()
+        current_datetime = f"{now.month}/{now.day}/{now.strftime('%y %H:%M')}"
+
+        data = (
+            "",
+            image_path,
+            img_key,
+            self.transaction_id,
+            self.project,
+            self.collection,
+            "",
+            current_datetime,
+            "",
+            "",
+            "",
+            item_code,
+            item_code_id,
+            tr_customer_id,
+            self.batch_name,
+        )
+        return data
+
+    @log_execution
+    def process_objects(self, objects: list[dict]) -> DataFrame:
+        """
+        Process a list of S3 objects and extract image-level metadata.
+
+        Args:
+            objects (list[dict]): List of S3 paginator pages with contents.
+
+        Returns:
+            list: List of tuples representing extracted image metadata.
+        """
+        results = []
+        for obj in objects:
+            for item in obj["Contents"]:
+                img_path = item["Key"]
+                res = self.process_image(img_path)
+                if res:
+                    results.append(res)
+        return results
+
+    @log_execution
+    def extract_metadata(self, location: S3Location) -> DataFrame:
+        """
+        Extract per-image metadata from S3 and build a Spark DataFrame.
+
+        Args:
+            location (S3Location): S3 location containing image objects.
+
+        Returns:
+            DataFrame: Spark DataFrame populated with per-image metadata.
+        """
+        logging.info(
+            f"Extracting metadata from Zip source: {location.prefix}\n"
+            f"File key parts: '{self.file_key_parts}'\n"
+            f"Project: '{self.project}'\n"
+            f"Collection: {self.collection}"
+
+        )
+        logging.info(f"tr_ocr_column is: {self.tr_ocr_column}")
+        if "REF" not in self.tr_ocr_column:
+            exit(
+                f"Invalid Batch Name {self.batch_name}. Missing REF field where OCR Text will be "
+                "populated"
+            )
+            #todo Write to Timestream
+
+        objects = self.get_objects_at_prefix()
+        data = self.process_objects(objects)
+        catalog_schema = self.get_glue_table_schema(
+            self.glue_client, self.glue_catalog
+        )
+        logging.info(f"Data to build spark dataframe: {data}")
+        logging.info(f"Columns to build spark dataframe: {catalog_schema}")
+        df_spark = self.spark.createDataFrame(data, schema=catalog_schema)
+        return df_spark
+
+
+class FactoryMetadataExtractor:
+    @staticmethod
+    def get_metadata_extractor(
+        source_file_name: str,
+        source: str,
+        location: S3Location,
+        s3_client: BaseClient,
+        spark: SparkSession,
+        batch_name: str,
+        transaction_id: str,
+        tr_credentials: TRCredentials,
+        glue_client: BaseClient,
+        glue_catalog: GlueCatalog,
+        workflow_name: str,
+        workflow_run_id: str,
+        opsiq_queue: str = None,
+        filter_parameters: dict = None,
+        timestream_config: dict = None,
+    ) -> MetadataExtractor:
+        """
+        Return a concrete MetadataExtractor implementation based on the source.
+
+        Args:
+            source_file_name (str): source_file_name identifier used to choose the extractor type.
+            source (str): Source identifier used for the pipeline.
+            location (S3Location): S3 location that points to the input data.
+            s3_client (BaseClient): Boto3 S3 client used by the extractor.
+            spark (SparkSession): Spark session used by the extractor.
+            batch_name (str): Batch identifier for the incoming data.
+            transaction_id (str): Transaction identifier for the batch.
+            tr_credentials (TRCredentials): Credentials for TR API calls when
+                required by the extractor.
+            glue_client (BaseClient): Boto3 Glue client used by the extractor.
+            glue_catalog (GlueCatalog): Glue catalog info used by image
+                extraction to fetch schema.
+            workflow_name (str): Glue workflow name used to store properties.
+            workflow_run_id (str): Glue workflow run id used to store props.
+            filter_parameters (dict): Optional filter parameters to update data.
+            timestream_config (dict): Timestream settings for error logging.
+
+        Returns:
+            MetadataExtractor: Concrete extractor instance for the given
+                source.
+
+        Raises:
+            ValueError: If the source_file_name does not match a supported extractor.
+        """
+        if "radix-onboarding-indexed" in source_file_name:
+            logging.info(
+                f"Creating CsvNoItemExtractor for source_file_name: '{source_file_name}'"
+            )
+            return CsvNoItemExtractor(
+                source_file_name=source_file_name,
+                source=source,
+                location=location,
+                tr_credentials=tr_credentials,
+                s3_client=s3_client,
+                glue_client=glue_client,
+                spark=spark,
+                batch_name=batch_name,
+                transaction_id=transaction_id,
+                workflow_name=workflow_name,
+                workflow_run_id=workflow_run_id,
+                opsiq_queue=opsiq_queue,
+                filter_parameters=filter_parameters,
+                timestream_config=timestream_config,
+            )
+        elif "tr-image-extract" in source_file_name:
+            logging.info(
+                f"Creating PerImageExtractor for source_file_name: '{source_file_name}'"
+            )
+            return PerImageExtractor(
+                location=location,
+                glue_catalog=glue_catalog,
+                s3_client=s3_client,
+                glue_client=glue_client,
+                spark=spark,
+                batch_name=batch_name,
+                transaction_id=transaction_id,
+            )
+        else:
+            message = f"Unsupported source type: {location.prefix}"
+            logging.error(message)
+            raise ValueError(message)
+
+
+class GlueJobExecution(GlueJobBase):
     def __init__(self):
         """
         Initialize Glue and Spark clients required to run the job.
@@ -241,22 +1056,12 @@ class GlueJobExecution:
         Returns:
             None
         """
-        self.glue_client = boto3.client("glue")
-        self.s3_client = boto3.client("s3")
+        super().__init__(pipeline_mod="ConnectCrawl")
         self.secret_manager = importlib.import_module(
             "etl-plugin-scripts.helper.ssm_services"
         )
-        self.pipeline_mod = "ConnectCrawl"
-        self.log = Onboarding_Log_Manager.get_module_logger(self.pipeline_mod)
-        sc = SparkContext()
-        glueContext = GlueContext(sc)
-        self.spark = glueContext.spark_session
-        self.job = Job(glueContext)
-        self.spark.conf.set(
-            "hive.exec.dynamic.partition.mode",
-            "nonstrict",
-        )  # Enable dynamic partitioning for flexible DataFrame writes.
 
+    @log_execution
     def unzip_s3_file(
         self,
         bucket_name: str,
@@ -309,7 +1114,7 @@ class GlueJobExecution:
                     )
 
             self.log.info(
-                f"Successfully extracted {len(file_list)} files to "
+                f"Successfully extracted {len(file_list)} files to \n"
                 f"s3://{bucket_name}/{target_prefix}"
             )
 
@@ -320,6 +1125,7 @@ class GlueJobExecution:
         except Exception as e:
             self.log.error(f"Unexpected error: {e}")
 
+    @log_execution
     def get_glue_table_schema(self, database_name: str, table_name: str) -> list:
         """
         Fetch the schema (non-partition columns) for a Glue table.
@@ -332,9 +1138,7 @@ class GlueJobExecution:
             list: Ordered list of non-partition column names.
         """
         try:
-            self.log.info(
-                f"Fetching schema for table: '{database_name}.{table_name}'"
-            )
+            self.log.info(f"Fetching schema for table: '{database_name}.{table_name}'")
 
             response = self.glue_client.get_table(
                 DatabaseName=database_name,
@@ -344,19 +1148,20 @@ class GlueJobExecution:
             ordered_columns = [_col["Name"] for _col in columns]
 
             self.log.info(
-                "Retrieved Glue schema order for table "
+                "Retrieved Glue schema order for table \n"
                 f"'{database_name}.{table_name}':\n{ordered_columns}"
             )
             return ordered_columns
 
         except Exception as e:
             self.log.error(
-                "Critical error in the 'get_glue_table_schema' function for "
-                f"the table '{database_name}.{table_name}':\n{str(e)}\n"
+                "Critical error in the 'get_glue_table_schema' function for the table \n"
+                f"'{database_name}.{table_name}':\n{str(e)}\n"
             )
             self.log.error(f"Error type: {type(e).__name__}")
             exit("ConnectCrawl - Critical error")
 
+    @log_execution
     def validate_and_prepare_dataframe(
         self,
         input_sdf: DataFrame,
@@ -396,23 +1201,22 @@ class GlueJobExecution:
         )
 
         if missing_columns:
-            self.log.warning(
-                f"Missing columns in input DataFrame:\n{missing_columns}"
-            )
+            self.log.warning(f"Missing columns in input DataFrame:\n{missing_columns}")
 
             for col in missing_columns:
                 input_sdf = input_sdf.withColumn(
                     col,
-                    lit("null").cast(StringType()),
+                    F.lit("null").cast(StringType()),
                 )
         else:
             self.log.info(
-                "There are not missing columns in the input dataframe with "
-                "respect to the required or expected columns."
+                "There are not missing columns in the input dataframe with respect to the\n"
+                "required or expected columns."
             )
 
         return input_sdf.select(*expected_columns)
 
+    @log_execution
     def write_to_glue_catalog(
         self,
         input_sdf: DataFrame,
@@ -442,8 +1246,7 @@ class GlueJobExecution:
         )
 
         self.log.info(
-            f"Writing '{prepared_df.count()}' records to "
-            f"'{target_db}.{target_table_name}'"
+            f"Writing '{prepared_df.count()}' records to '{target_db}.{target_table_name}'"
         )
         self.log.info(f"Final columns are:\n{prepared_df.columns}")
 
@@ -453,99 +1256,7 @@ class GlueJobExecution:
 
         self.log.info("Successfully wrote to Glue catalog")
 
-    def create_timestream_content(
-        self,
-        source: str,
-        source_device: str,
-        transaction_id: str,
-        batch_name: str,
-        state: str,
-        no_of_asset: str,
-        file_path: str = None
-    ) -> dict:
-        """
-        Build a Timestream payload for success/processing state tracking.
-
-        Args:
-            source (str): Source identifier for the ingestion.
-            source_device (str): Device/Pipeline name for dimension.
-            transaction_id (str): Transaction identifier for the run.
-            batch_name (str): Batch identifier for the run.
-            state (str): Pipeline state to report (e.g., Ready, Complete).
-            no_of_asset (str): Number of assets represented by the event.
-            file_path (str): Optional file path for per-asset reporting.
-
-        Returns:
-            dict: Timestream payload containing dimensions and measures.
-        """
-        content = {
-            "Dimensions": [
-                {"Source": source, "Type": "VARCHAR"},
-                {"PipelineName": source_device, "Type": "VARCHAR"},
-                {"TransactionId": transaction_id, "Type": "VARCHAR"},
-                {"BatchName": batch_name, "Type": "VARCHAR"},
-            ],
-            "Measures": [
-                {"PipelineModule": self.pipeline_mod, "Type": "VARCHAR"},
-                {"State": state, "Type": "VARCHAR"},
-                {"NoOfAsset": no_of_asset, "Type": "BIGINT"},
-            ],
-        }
-        if file_path:
-            content["Dimensions"].append(
-                {"FilePath": file_path, "Type": "VARCHAR"}
-            )
-        return content
-
-    def create_timestream_failure_content(
-        self,
-        source: str,
-        source_device: str,
-        transaction_id: str,
-        batch_name: str,
-        error: str,
-        error_code: str,
-        record_count: str,
-        tr_account_name: str = "-"
-    ) -> dict:
-        """
-        Build a Timestream payload for failure reporting.
-
-        Args:
-            source (str): Source identifier for the ingestion.
-            source_device (str): Device/Pipeline name for dimension.
-            transaction_id (str): Transaction identifier for the run.
-            batch_name (str): Batch identifier for the run.
-            error (str): Error message to report.
-            error_code (str): Error code to classify the failure.
-            record_count (str): Number of affected records/assets.
-            tr_account_name (str): Optional TR account number/name.
-
-        Returns:
-            dict: Timestream payload containing failure details.
-        """
-        content = {
-            "Dimensions": [
-                {"Source": source, "Type": "VARCHAR"},
-                {"PipelineName": source_device, "Type": "VARCHAR"},
-                {"TRAccountNo": tr_account_name, "Type": "VARCHAR"},
-                {"TransactionId": transaction_id, "Type": "VARCHAR"},
-                {
-                    "TimeStamp": str(int(datetime.now().timestamp() * 1000)),
-                    "Type": "VARCHAR",
-                },
-                {"BatchName": batch_name, "Type": "VARCHAR"},
-                {"Error": error, "Type": "VARCHAR"},
-                {"ErrorCode": error_code, "Type": "VARCHAR"},
-            ],
-            "Measures": [
-                {"PipelineModule": self.pipeline_mod, "Type": "VARCHAR"},
-                {"State": "Failed", "Type": "VARCHAR"},
-                {"NoOfAsset": record_count, "Type": "BIGINT"},
-            ],
-        }
-        return content
-
+    @log_execution
     def report_complete_per_row(
         self,
         df_spark: DataFrame,
@@ -565,40 +1276,24 @@ class GlueJobExecution:
         """
         rows = df_spark.collect()
         for row in rows:
-            Onboarding_Timestream_Manager.timestream_insert_data(
+            timestream_insert_data(
                 db=job_vars.timestream_db,
                 table=job_vars.timestream_table,
                 timestream_queue=job_vars.timestream_sqs_queue,
                 measure_name=f"OnboardingWF_{self.pipeline_mod}",
-                content=self.create_timestream_content(
+                content=create_timestream_content(
                     source=workflow_params.source,
                     source_device=workflow_params.source_device,
                     transaction_id=workflow_params.transaction_id,
                     batch_name=workflow_params.batch_name,
+                    pipeline_mod=self.pipeline_mod,
                     state="Complete",
                     no_of_asset="1",
                     file_path=str(row["image_path"]),
                 ),
             )
 
-    def get_workflow_params(self, job_vars: JobVariables) -> WorkflowParams:
-        """
-        Fetch workflow run properties and build a WorkflowParams object.
-
-        Args:
-            job_vars (JobVariables): Job variables containing workflow ids.
-
-        Returns:
-            WorkflowParams: Parsed workflow parameters object.
-        """
-        workflow_params = self.glue_client.get_workflow_run_properties(
-            Name=job_vars.workflow_name,
-            RunId=job_vars.workflow_run_id,
-        )["RunProperties"]
-        workflow_params_obj = WorkflowParams(workflow_params, self.log)
-        self.log.info(f"Workflow params: {workflow_params_obj}")
-        return workflow_params_obj
-
+    @log_execution
     def get_tr_credentials(self, job_vars: JobVariables) -> TRCredentials:
         """
         Fetch TR credentials from Secrets Manager and build TRCredentials.
@@ -620,6 +1315,7 @@ class GlueJobExecution:
         self.log.info("Fetched TR Credentials to create Token")
         return tr_credentials
 
+    @log_execution
     def main(self):
         """
         Run the Glue job end-to-end for onboarding ingestion.
@@ -665,10 +1361,10 @@ class GlueJobExecution:
 
             self.log.info(
                 f"""
-                Step Name: Connect_Crawl
-                Execution Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                Next Step: OCR_Image
-            """
+                    Step Name: ConnectCrawl
+                    Execution Date: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                    Next Step: OCR_Image
+                """
             )
 
             self.log.info(f"Job Variables:\n{job_vars}")
@@ -680,16 +1376,17 @@ class GlueJobExecution:
 
             tr_credentials = self.get_tr_credentials(job_vars)
 
-            Onboarding_Timestream_Manager.timestream_insert_data(
+            timestream_insert_data(
                 db=job_vars.timestream_db,
                 table=job_vars.timestream_table,
                 timestream_queue=job_vars.timestream_sqs_queue,
                 measure_name=f"OnboardingWF_{self.pipeline_mod}",
-                content=self.create_timestream_content(
+                content=create_timestream_content(
                     source=workflow_params.source,
                     source_device=workflow_params.source_device,
                     transaction_id=workflow_params.transaction_id,
                     batch_name=workflow_params.batch_name,
+                    pipeline_mod=self.pipeline_mod,
                     state="Ready",
                     no_of_asset="0",
                 ),
@@ -738,16 +1435,17 @@ class GlueJobExecution:
                 message = f"Error during metadata extraction: {e}"
                 self.log.error(message)
 
-                Onboarding_Timestream_Manager.timestream_insert_data(
+                timestream_insert_data(
                     db=job_vars.timestream_db,
                     table=job_vars.timestream_table,
                     timestream_queue=job_vars.timestream_sqs_queue,
                     measure_name=f"OnboardingWF_{self.pipeline_mod}",
-                    content=self.create_timestream_failure_content(
+                    content=create_timestream_failure_content(
                         source=workflow_params.source,
                         source_device=workflow_params.source_device,
                         transaction_id=workflow_params.transaction_id,
                         batch_name=workflow_params.batch_name,
+                        pipeline_mod=self.pipeline_mod,
                         error=str(e),
                         error_code="42",
                         record_count="0",
@@ -761,16 +1459,17 @@ class GlueJobExecution:
                 job_vars.catalog_db,
                 job_vars.incoming_catalog_table,
             )
-            Onboarding_Timestream_Manager.timestream_insert_data(
+            timestream_insert_data(
                 db=job_vars.timestream_db,
                 table=job_vars.timestream_table,
                 timestream_queue=job_vars.timestream_sqs_queue,
                 measure_name=f"OnboardingWF_{self.pipeline_mod}",
-                content=self.create_timestream_content(
+                content=create_timestream_content(
                     source=workflow_params.source,
                     source_device=workflow_params.source_device,
                     transaction_id=workflow_params.transaction_id,
                     batch_name=workflow_params.batch_name,
+                    pipeline_mod=self.pipeline_mod,
                     state="Complete",
                     no_of_asset=str(df_spark.count()),
                 ),
@@ -782,16 +1481,17 @@ class GlueJobExecution:
             self.log.error(f"Critical error in the 'main' function:\n{str(e)}")
             self.log.error(f"Error type: {type(e).__name__}")
 
-            Onboarding_Timestream_Manager.timestream_insert_data(
+            timestream_insert_data(
                 db=job_vars.timestream_db,
                 table=job_vars.timestream_table,
                 timestream_queue=job_vars.timestream_sqs_queue,
                 measure_name=f"OnboardingWF_{self.pipeline_mod}",
-                content=self.create_timestream_content(
+                content=create_timestream_content(
                     source=workflow_params.source,
                     source_device=workflow_params.source_device,
                     transaction_id=workflow_params.transaction_id,
                     batch_name=workflow_params.batch_name,
+                    pipeline_mod=self.pipeline_mod,
                     state="Failed",
                     no_of_asset="-",
                 ),

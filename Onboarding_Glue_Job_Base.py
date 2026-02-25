@@ -1,5 +1,6 @@
 import Onboarding_Log_Manager
 import boto3
+import ast
 from logging import Logger
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
@@ -72,11 +73,13 @@ class WorkflowParams:
         """
         self.transaction_id = workflow_params["transaction_id"]
         self.source = workflow_params["source"]
-        self.zip_key = workflow_params["zip_key"]
+        raw_zip_key = workflow_params["zip_key"]
+        self.zip_key = self.normalize_zip_key(raw_zip_key)
         self.incoming_bucket = workflow_params["incoming_bucket"]
         self.source_device = workflow_params["source_device"]
         self.log = log
         self.batch_name = self.get_batch_name()
+        self.filter_parameters = self.get_filter_parameters(workflow_params)
 
     def __repr__(self) -> str:
         """
@@ -95,6 +98,7 @@ class WorkflowParams:
             f"incoming_bucket: '{self.incoming_bucket}'\n"
             f"source_device: '{self.source_device}'\n"
             f"batch_name: '{self.batch_name}'\n"
+            f"filter_parameters: '{self.filter_parameters}'\n"
         )
 
     def get_batch_name(self) -> str:
@@ -136,6 +140,71 @@ class WorkflowParams:
         self.log.info(f"target_prefix: '{target_prefix}'")
 
         return target_prefix
+    
+    def get_filter_parameters(self, workflow_params: dict) -> dict:
+        """
+        Extract and parse filter parameters from workflow parameters.
+
+        Args:
+            workflow_params (dict): Dictionary containing workflow runtime
+                parameters.
+
+        Returns:
+            dict: Parsed filter parameters or empty dict if not present.
+        """
+        filter_params_str = workflow_params.get("filter_parameters", None)
+        if not filter_params_str:
+            return {}
+        
+        try:
+            return ast.literal_eval(filter_params_str)
+        except (ValueError, SyntaxError):
+            self.log.warning(f"Failed to parse filter_parameters: {filter_params_str}")
+            return {}
+        
+    def find_prefix(self) -> str:
+        prefix = None
+        if self.filter_parameters:
+            prefix = self.filter_parameters.get("zip_key_prefix")
+            if not prefix and self.batch_name in self.filter_parameters:
+                batch_config = self.filter_parameters[self.batch_name]
+                prefix = batch_config.get("zip_key_prefix")
+        return prefix
+    
+    def normalize_zip_key(self, raw_zip_key: str) -> str:
+        """
+        Ensure the zip_key has the correct prefix path.
+        If the key has no slashes, it tries to find a prefix in filter_parameters
+        or defaults to 'radix-onboarding-indexed/'.
+
+        Args:
+            raw_zip_key (str): The zip key string from workflow params.
+
+        Returns:
+            str: The normalized zip key with a path prefix.
+        """
+        if "/" in raw_zip_key:
+            return raw_zip_key
+        
+        self.log.info(f"Detected zip_key without path: '{raw_zip_key}'. Attempting to normalize.")
+
+        prefix = self.find_prefix()
+
+        if not prefix:
+            prefix = "radix-onboarding-indexed/"
+            self.log.info(
+                "No 'zip_key_prefix' found in parameters. Using default:\n"
+                "'radix-onboarding-indexed/'"
+            )
+        else:
+            self.log.info(f"Using configured 'zip_key_prefix': '{prefix}'")
+
+        if not prefix.endswith("/"):
+            prefix += "/"
+            
+        normalized_key = f"{prefix}{raw_zip_key}"
+        self.log.info(f"Normalized zip_key: '{normalized_key}'")
+        return normalized_key
 
 
 class GlueJobBase:
