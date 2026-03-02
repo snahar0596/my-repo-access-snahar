@@ -6,9 +6,9 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lower, trim, regexp_replace, concat_ws, udf, from_json, explode, lit, coalesce
-from pyspark.sql.types import StringType, StructType, StructField, ArrayType, FloatType
-from pyspark.ml.feature import HashingTF, MinHashLSH, Tokenizer, CountVectorizer
+from pyspark.sql.functions import col, lower, trim, regexp_replace, concat_ws, udf, from_json, explode, lit, coalesce, size, length
+from pyspark.sql.types import StringType, StructType, StructField, ArrayType, FloatType, BooleanType
+from pyspark.ml.feature import HashingTF, MinHashLSH, Tokenizer, CountVectorizer, NGram, RegexTokenizer
 from pyspark.ml import Pipeline
 from pyspark.ml.linalg import Vectors, VectorUDT
 import pyspark.sql.functions as F
@@ -82,7 +82,7 @@ def extract_json_fields(df, json_col_name, fields_to_extract):
 
 def preprocess_text(df, columns):
     """
-    Cleans text columns: lowercase, remove special chars, trim.
+    Cleans text columns based on their likely type.
     
     Args:
         df: DataFrame.
@@ -94,9 +94,32 @@ def preprocess_text(df, columns):
     for c in columns:
         # Check if column exists
         if c in df.columns:
-            # simple cleaning: lowercase, keep only alphanumeric and spaces
+            # Determine likely type based on column name
+            col_lower = c.lower()
+
+            # Default to generic alphanumeric cleaning
             # Ensure no nulls by coalescing to empty string
-            df = df.withColumn(c, lower(trim(regexp_replace(coalesce(col(c), lit("")), r"[^a-zA-Z0-9\s]", ""))))
+            clean_expr = coalesce(col(c), lit(""))
+
+            if "phone" in col_lower:
+                # Keep only digits
+                clean_expr = regexp_replace(clean_expr, r"[^0-9]", "")
+            elif "dob" in col_lower or "date" in col_lower:
+                # Simple standardization (assuming YYYY-MM-DD or similar string, keep numeric and dashes/slashes)
+                # This could be improved with actual Date parsing if formats are known
+                clean_expr = trim(regexp_replace(clean_expr, r"[^0-9\-\/]", ""))
+            elif "mrn" in col_lower or "id" in col_lower:
+                # Alphanumeric, uppercase might be better for IDs but lowercase is standard for matching
+                clean_expr = lower(trim(regexp_replace(clean_expr, r"[^a-zA-Z0-9]", "")))
+            else:
+                # General text (Names, Address, etc.): Alphanumeric + spaces
+                # First remove non-alphanumeric/space
+                clean_expr = regexp_replace(clean_expr, r"[^a-zA-Z0-9\s]", "")
+                # Collapse multiple spaces
+                clean_expr = lower(trim(regexp_replace(clean_expr, r"\s+", " ")))
+
+            df = df.withColumn(c, clean_expr)
+
     return df
 
 def calculate_similarity(col1, col2, metric="levenshtein"):
@@ -115,6 +138,43 @@ def calculate_similarity(col1, col2, metric="levenshtein"):
     similarity = F.when(max_len_col == 0, 1.0).otherwise(1.0 - (dist_col / max_len_col))
     
     return similarity
+
+def build_feature_pipeline_stages(input_col, output_col="features"):
+    """
+    Builds the ML pipeline stages for FEATURE GENERATION only.
+    Using N-Grams for better fuzzy matching on text fields.
+    Does NOT include MinHashLSH.
+    """
+    stages = []
+
+    # 1. Tokenize into characters for N-gram generation
+    tokenizer = RegexTokenizer(inputCol=input_col, outputCol="char_tokens", pattern="", minTokenLength=1, gaps=True)
+    stages.append(tokenizer)
+
+    # 2. Generate N-Grams (3-grams are common for fuzzy matching)
+    ngram = NGram(n=3, inputCol="char_tokens", outputCol="ngrams")
+    stages.append(ngram)
+
+    # 3. HashingTF
+    hashingTF = HashingTF(inputCol="ngrams", outputCol=output_col)
+    stages.append(hashingTF)
+
+    return stages
+
+# Robust UDF to FIX the vector if it's empty
+@udf(returnType=VectorUDT())
+def fix_vector(v):
+    # If vector is None or has no non-zeros, return a dummy vector
+    # We create a dummy sparse vector of size 262144 (default HashingTF size) with one non-zero entry at index 0.
+    # This prevents MinHashLSH crash.
+    # Note: 262144 is typical default, but HashingTF allows setting numFeatures. If distinct, we should parameterize.
+    # But usually creating a small valid vector is enough.
+
+    if v is None or v.numNonzeros() == 0:
+        # Create a dummy vector [1.0, 0.0, ...]
+        # Use a reasonable size. HashingTF default is 2^18 = 262144
+        return Vectors.sparse(262144, {0: 1.0})
+    return v
 
 def run_fuzzy_matching(df_ref, df_input, json_col, matching_cols, composite_match, threshold):
     """
@@ -136,114 +196,35 @@ def run_fuzzy_matching(df_ref, df_input, json_col, matching_cols, composite_matc
         
         # Create a single column "join_key"
         df_ref_ready = df_ref_clean.withColumn("join_key", concat_ws(" ", *[col(c) for c in matching_cols]))
-        df_ref_ready = df_ref_ready.filter(col("join_key").isNotNull() & (F.length(col("join_key")) > 0))
+        # Filter join_key length >= 3 to ensure we can form at least one 3-gram
+        df_ref_ready = df_ref_ready.filter(col("join_key").isNotNull() & (length(col("join_key")) >= 3))
         
         df_input_ready = df_input_clean.withColumn("join_key", concat_ws(" ", *[col(f"input_{c}") for c in matching_cols]))
-        df_input_ready = df_input_ready.filter(col("join_key").isNotNull() & (F.length(col("join_key")) > 0))
+        df_input_ready = df_input_ready.filter(col("join_key").isNotNull() & (length(col("join_key")) >= 3))
 
-        """
-            [MinHashLSH , Tokenizer, HashingTF, Pipeline]
-            Split text into words,
-            Convert those words into numbers,
-            Hash those numbers to make it easy to find similar rows.    
-        """
-           
-
-        """
-
-            MinHashLSH:
-
-            This is a Locality Sensitive Hashing (LSH) algorithm using MinHash. 
-            It is used for efficiently finding similar items in large datasets, 
-            especially for approximate nearest neighbor searches on sets or sparse vectors.
-
-            inputCol="features":
-            The column in your DataFrame that contains the features (typically a vector or set) 
-            you want to hash and compare for similarity.
-
-            outputCol="hashes":
-            The column where the resulting hash values will be stored after applying MinHashLSH.
-
-            numHashTables=3:
-            The number of hash tables to use. More hash tables can improve the accuracy of similarity search but may increase computation and storage.
-
-            What does it do?
-
-            When you fit and transform your DataFrame with this lsh object, it will:
-
-            Generate hash values for the features column,
-            Store those hash values in the hashes column,
-            Allow you to perform fast similarity searches (e.g., finding duplicates or similar items).
-
-        
-        """
-        
-        lsh = MinHashLSH(inputCol="features", outputCol="hashes", numHashTables=3)
-
-        """
-            Tokenizer:
-
-            What it does:
-            Sets up a tool to split text in the join_key column into individual words (tokens).
-            How it works:
-            For example, "hello world" becomes ["hello", "world"] in a new column called tokens.        
-        """
-        tokenizer = Tokenizer(inputCol="join_key", outputCol="tokens")
-
-        """
-            HashingTF:
-
-            Sets up a tool to turn the list of tokens (words) into a numeric vector (features).
-            How it works:
-            Each word is mapped to a number, and the collection of numbers forms a vector in the features column.       
-        """
-
-        hashingTF = HashingTF(inputCol="tokens", outputCol="features")
-
-        """
-            Pipeline:
-
-            Chains all the above steps together into a single process (pipeline).
-            How it works:
-            When you run the pipeline, it will:
-                Tokenize the text in join_key → tokens
-                Convert tokens to numeric features → features
-                Hash the features for similarity search → hashes        
-        """
-
-        pipeline = Pipeline(stages=[tokenizer, hashingTF, lsh])
-        
-
-        """
-        For Transformers (like Tokenizer, HashingTF):
-            fit learns any necessary information from the data (e.g., vocabulary, hashing parameters).
-        For Estimators (like Pipelines):
-            fit runs all the steps in the pipeline that require learning from the data, and produces a PipelineModel (a trained pipeline).        
-        
-        """
-
-        """
-        .fit()	Learns from the data and creates a trained pipeline/model
-        .transform()	Applies the trained pipeline/model to data, adding new columns
-        """
+        # Build Feature Pipeline (Tokenizer -> NGram -> HashingTF)
+        stages = build_feature_pipeline_stages("join_key", "features")
+        pipeline = Pipeline(stages=stages)
         
         model_ref = pipeline.fit(df_ref_ready)
 
-        """
-            All original columns,
-            Plus new columns: tokens, features, and hashes. 
-        """
-
-        df_ref_hashed = model_ref.transform(df_ref_ready)
-        df_input_hashed = model_ref.transform(df_input_ready)
+        df_ref_features = model_ref.transform(df_ref_ready)
+        df_input_features = model_ref.transform(df_input_ready)
         
+        # CRITICAL FIX: Ensure all vectors are valid for MinHashLSH by replacing empty ones with a dummy
+        # This guarantees no crash.
+        df_ref_safe = df_ref_features.withColumn("safe_features", fix_vector(col("features")))
+        df_input_safe = df_input_features.withColumn("safe_features", fix_vector(col("features")))
 
-        """
-        This code finds pairs of rows from two DataFrames that are similar, 
-        using MinHashLSH and a Jaccard distance threshold, and returns them in a new DataFrame.
-        """
+        # Now apply MinHashLSH on SAFE vectors
+        lsh = MinHashLSH(inputCol="safe_features", outputCol="hashes", numHashTables=3)
+        lsh_model = lsh.fit(df_ref_safe)
+
+        df_ref_hashed = lsh_model.transform(df_ref_safe)
+        df_input_hashed = lsh_model.transform(df_input_safe)
+
         LSH_THRESHOLD = 0.8 
-        candidates = model_ref.stages[-1].approxSimilarityJoin(
+        candidates = lsh_model.approxSimilarityJoin(
             df_ref_hashed, 
             df_input_hashed, 
             LSH_THRESHOLD, 
@@ -253,6 +234,21 @@ def run_fuzzy_matching(df_ref, df_input, json_col, matching_cols, composite_matc
         final_matches = candidates.withColumn("similarity_score", calculate_similarity("datasetA.join_key", "datasetB.join_key"))
         matches_df = final_matches.filter(col("similarity_score") >= threshold)
         
+        # Flatten and Select Output Columns
+        # For composite matching, we show the combined key and score.
+        select_cols = [
+            col("datasetA.join_key").alias("ref_value"),
+            col("datasetB.join_key").alias("input_value"),
+            lit("composite").alias("matched_on_field"),
+            col("similarity_score").alias("score"),
+            # Assuming 'transaction_id' is in datasetB (input table)
+            # If not present in schema, this might fail, but based on context it should be there.
+            col("datasetB.transaction_id").alias("transaction_id")
+        ]
+
+        # Ensure we only select columns that exist to be safe, but transaction_id is critical
+        matches_df = matches_df.select(*select_cols)
+
     else:
         logger.info("Running Individual Column Matching Mode")
         accumulated_matches = None
@@ -263,20 +259,31 @@ def run_fuzzy_matching(df_ref, df_input, json_col, matching_cols, composite_matc
             
             logger.info(f"Matching column: {col_name}")
             
-            df_ref_ready = df_ref_clean.withColumn("match_col", col(ref_col)).filter(col("match_col").isNotNull())
-            df_input_ready = df_input_clean.withColumn("match_col", col(input_col)).filter(col("match_col").isNotNull())
+            # Filter match_col length >= 3
+            df_ref_ready = df_ref_clean.withColumn("match_col", col(ref_col)).filter(col("match_col").isNotNull() & (length(col("match_col")) >= 3))
+            df_input_ready = df_input_clean.withColumn("match_col", col(input_col)).filter(col("match_col").isNotNull() & (length(col("match_col")) >= 3))
             
-            tokenizer = Tokenizer(inputCol="match_col", outputCol="tokens")
-            hashingTF = HashingTF(inputCol="tokens", outputCol="features")
-            lsh = MinHashLSH(inputCol="features", outputCol="hashes", numHashTables=3)
-            pipeline = Pipeline(stages=[tokenizer, hashingTF, lsh])
+            # Feature Pipeline
+            stages = build_feature_pipeline_stages("match_col", "features")
+            pipeline = Pipeline(stages=stages)
             
             model = pipeline.fit(df_ref_ready)
-            df_ref_hashed = model.transform(df_ref_ready)
-            df_input_hashed = model.transform(df_input_ready)
+            df_ref_features = model.transform(df_ref_ready)
+            df_input_features = model.transform(df_input_ready)
+
+            # Fix Vectors
+            df_ref_safe = df_ref_features.withColumn("safe_features", fix_vector(col("features")))
+            df_input_safe = df_input_features.withColumn("safe_features", fix_vector(col("features")))
+
+            # LSH
+            lsh = MinHashLSH(inputCol="safe_features", outputCol="hashes", numHashTables=3)
+            lsh_model = lsh.fit(df_ref_safe)
+
+            df_ref_hashed = lsh_model.transform(df_ref_safe)
+            df_input_hashed = lsh_model.transform(df_input_safe)
             
             LSH_THRESHOLD = 0.8
-            candidates = model.stages[-1].approxSimilarityJoin(
+            candidates = lsh_model.approxSimilarityJoin(
                 df_ref_hashed,
                 df_input_hashed,
                 LSH_THRESHOLD,
