@@ -453,6 +453,75 @@ def create_itemcode(row, tr_customer_id, tr_work_order_id, tr_type_id, tr_storag
         return f"Exception: {e}"
 
 
+def get_tr_center_id(item_id, tr_access_token):
+    get_item_api = f"https://{tr_base_api}/api/v1.0/Items/{item_id}/GetItem"
+    headers = {"Authorization": f"Bearer {tr_access_token}", "Content-Type": "application/json"}
+    try:
+        res = requests.get(get_item_api, headers=headers)
+        if res.status_code == 200:
+            return res.json().get('trCenterID')
+        else:
+            log.error(f"Failed to get item {item_id}. Status code: {res.status_code}, Response: {res.text}")
+            return None
+    except Exception as e:
+        log.error(f"Exception calling GetItem for item {item_id}: {e}")
+        return None
+
+
+def upload_image_to_tr(center_id, item_code, file_name, file_bytes, tr_access_token):
+    add_file_api = f"https://{tr_base_api}/api/v1.0/Items/AddFile"
+    headers = {"Authorization": f"Bearer {tr_access_token}", "Content-Type": "application/json"}
+    payload = {
+        "CenterID": center_id,
+        "ItemCode": item_code,
+        "FileName": file_name,
+        "FileBytes": file_bytes
+    }
+    try:
+        res = requests.post(add_file_api, json=payload, headers=headers)
+        if res.status_code == 200:
+            return "File Uploaded"
+        else:
+            log.error(f"Failed to upload file {file_name} for item {item_code}. Status: {res.status_code}, Response: {res.text}")
+            return f"Error: {res.status_code}"
+    except Exception as e:
+        log.error(f"Exception calling AddFile for item {item_code}: {e}")
+        return f"Exception: {e}"
+
+
+def process_image_upload(row, incoming_bucket, tr_access_token):
+    # Skip if TR creation/update wasn't successful
+    if row.get('tr_load_status') != "Ref Fields Updated":
+        return "Skipped: TR Item not successfully created/updated"
+
+    item_code_id = row.get('ItemCodeID')
+    item_code = row.get('ItemCode')
+    image_path = row.get('image_path')
+
+    if not item_code_id or not item_code or not image_path:
+        return "Error: Missing required fields for image upload"
+
+    try:
+        # Get CenterID
+        center_id = get_tr_center_id(item_code_id, tr_access_token)
+        if center_id is None:
+            return "Error: Could not retrieve CenterID"
+
+        # Download S3 file
+        response = s3_client.get_object(Bucket=incoming_bucket, Key=image_path)
+        file_bytes = list(response['Body'].read())
+
+        # Extract filename
+        file_name = image_path.split('/')[-1]
+
+        # Base64 encode file_bytes if needed, but requirements imply standard json list of bytes
+        # or string. We use the list of bytes per acceptance/description.
+        return upload_image_to_tr(center_id, item_code, file_name, file_bytes, tr_access_token)
+    except Exception as e:
+        log.error(f"Error processing image upload for {image_path}: {e}")
+        return f"Exception: {e}"
+
+
 def update_item_refs(row):
     update_item_ref_api = f"https://{tr_base_api}/api/v1.0/Items/UpdateItemRef"
     headers = {"Authorization": f"Bearer {tr_access_token}", "Content-Type": "application/json"}
@@ -571,6 +640,7 @@ def main(**kwargs):
         config_present = False
         load_to_system_of_records = False
         bypassed_opsiq_flag = False
+        load_images_to_totalrecall = False
 
         try:
             tr_account_name, collection_config = ConfigurationTemplate.get_collection_config_from_catalog(
@@ -583,8 +653,15 @@ def main(**kwargs):
                 tr_customer_id = collection_config.get("tr_customer_id", '-')
                 bypassed_opsiq = collection_config.get("send_all_to_opsiq", "false")
                 bypassed_opsiq_flag = True if bypassed_opsiq == "bypass" else False
+
+                # Check for load_images_to flag
+                load_images_to = collection_config.get("load_images_to", "")
+                if str(load_images_to).lower() == "totalrecall":
+                    load_images_to_totalrecall = True
+
                 log.info(f"The TR Customer ID is: {tr_customer_id}")
                 log.info(f"The bypassed_opsiq_flag is: {bypassed_opsiq_flag}")
+                log.info(f"The load_images_to_totalrecall flag is: {load_images_to_totalrecall}")
         except (ConfigurationNotFound, CollectionNotFound, ClientError) as e:
             log.warning(f"Configuration NOT Found: {e}")
             config_present = False
@@ -1181,6 +1258,57 @@ def main(**kwargs):
 
                     log.info("TR Load: Complete")
 
+                    if load_images_to_totalrecall:
+                        log.info("Initiating Image Upload to TR")
+                        final_pdf['image_upload_status'] = final_pdf.apply(process_image_upload, axis=1, args=(incoming_bucket, tr_access_token))
+
+                        # Log to Timestream
+                        for upload_row in final_pdf.itertuples(index=True):
+                            if upload_row.tr_load_status != "Ref Fields Updated":
+                                continue
+
+                            if upload_row.image_upload_status == "File Uploaded":
+                                Onboarding_Timestream_Manager.timestream_insert_data(
+                                    db=args["TimestreamDB"],
+                                    table=args["TimestreamTable"],
+                                    timestream_queue=args["TimestreamSQSQueue"],
+                                    measure_name=f'OnboardingWF_{pipeline_mod}',
+                                    content=Onboarding_Timestream_Manager.create_timestream_content(
+                                        source=source,
+                                        source_device=source_device,
+                                        transaction_id=transaction_id,
+                                        batch_name=batch_name,
+                                        pipeline_mod=pipeline_mod,
+                                        state="Complete",
+                                        no_of_asset="1",
+                                        item_code=upload_row.ItemCode,
+                                        file_path=upload_row.image_path,
+                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                        event_name="TRImageUpload"
+                                    )
+                                )
+                            else:
+                                Onboarding_Timestream_Manager.timestream_insert_data(
+                                    db=args["TimestreamDB"],
+                                    table=args["TimestreamTable"],
+                                    timestream_queue=args["TimestreamSQSQueue"],
+                                    measure_name=f'OnboardingWF_{pipeline_mod}',
+                                    content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                        source=source,
+                                        source_device=source_device,
+                                        transaction_id=transaction_id,
+                                        batch_name=batch_name,
+                                        pipeline_mod=pipeline_mod,
+                                        record_count="1",
+                                        error=upload_row.image_upload_status,
+                                        error_code="48",
+                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                        event_name="TRImageUpload",
+                                        file_path=upload_row.image_path
+                                    )
+                                )
+                        log.info("TR Image Upload: Complete")
+
                     final_record_count = len(final_pdf[final_pdf.tr_load_status == "Ref Fields Updated"])
                     log.info(f"Records in the LoadData Module that got loaded: {final_record_count}")
                     Onboarding_Timestream_Manager.timestream_insert_data(
@@ -1714,6 +1842,57 @@ def main(**kwargs):
 
                     log.info("TR Load: Complete")
 
+                    if load_images_to_totalrecall:
+                        log.info("Initiating Image Upload to TR")
+                        final_pdf['image_upload_status'] = final_pdf.apply(process_image_upload, axis=1, args=(incoming_bucket, tr_access_token))
+
+                        # Log to Timestream
+                        for upload_row in final_pdf.itertuples(index=True):
+                            if upload_row.tr_load_status != "Ref Fields Updated":
+                                continue
+
+                            if upload_row.image_upload_status == "File Uploaded":
+                                Onboarding_Timestream_Manager.timestream_insert_data(
+                                    db=args["TimestreamDB"],
+                                    table=args["TimestreamTable"],
+                                    timestream_queue=args["TimestreamSQSQueue"],
+                                    measure_name=f'OnboardingWF_{pipeline_mod}',
+                                    content=Onboarding_Timestream_Manager.create_timestream_content(
+                                        source=source,
+                                        source_device=source_device,
+                                        transaction_id=transaction_id,
+                                        batch_name=batch_name,
+                                        pipeline_mod=pipeline_mod,
+                                        state="Complete",
+                                        no_of_asset="1",
+                                        item_code=upload_row.ItemCode,
+                                        file_path=upload_row.image_path,
+                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                        event_name="TRImageUpload"
+                                    )
+                                )
+                            else:
+                                Onboarding_Timestream_Manager.timestream_insert_data(
+                                    db=args["TimestreamDB"],
+                                    table=args["TimestreamTable"],
+                                    timestream_queue=args["TimestreamSQSQueue"],
+                                    measure_name=f'OnboardingWF_{pipeline_mod}',
+                                    content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                        source=source,
+                                        source_device=source_device,
+                                        transaction_id=transaction_id,
+                                        batch_name=batch_name,
+                                        pipeline_mod=pipeline_mod,
+                                        record_count="1",
+                                        error=upload_row.image_upload_status,
+                                        error_code="48",
+                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                        event_name="TRImageUpload",
+                                        file_path=upload_row.image_path
+                                    )
+                                )
+                        log.info("TR Image Upload: Complete")
+
                     final_record_count = len(final_pdf[final_pdf.tr_load_status == "Ref Fields Updated"])
                     log.info(f"Records in the LoadData Module that got loaded: {final_record_count}")
                     Onboarding_Timestream_Manager.timestream_insert_data(
@@ -1838,6 +2017,59 @@ def main(**kwargs):
                     )
 
             log.info("TR Load: Complete")
+
+            # Since load_images_to_totalrecall uses config which is missing in Path C, it will be False.
+            # But just in case we need it here, we add it similarly gated by the flag:
+            if load_images_to_totalrecall:
+                log.info("Initiating Image Upload to TR")
+                final_pdf['image_upload_status'] = final_pdf.apply(process_image_upload, axis=1, args=(incoming_bucket, tr_access_token))
+
+                # Log to Timestream
+                for upload_row in final_pdf.itertuples(index=True):
+                    if upload_row.tr_load_status != "Ref Fields Updated":
+                        continue
+
+                    if upload_row.image_upload_status == "File Uploaded":
+                        Onboarding_Timestream_Manager.timestream_insert_data(
+                            db=args["TimestreamDB"],
+                            table=args["TimestreamTable"],
+                            timestream_queue=args["TimestreamSQSQueue"],
+                            measure_name=f'OnboardingWF_{pipeline_mod}',
+                            content=Onboarding_Timestream_Manager.create_timestream_content(
+                                source=source,
+                                source_device=source_device,
+                                transaction_id=transaction_id,
+                                batch_name=batch_name,
+                                pipeline_mod=pipeline_mod,
+                                state="Complete",
+                                no_of_asset="1",
+                                item_code=upload_row.item_code,
+                                file_path=upload_row.image_path,
+                                tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                event_name="TRImageUpload"
+                            )
+                        )
+                    else:
+                        Onboarding_Timestream_Manager.timestream_insert_data(
+                            db=args["TimestreamDB"],
+                            table=args["TimestreamTable"],
+                            timestream_queue=args["TimestreamSQSQueue"],
+                            measure_name=f'OnboardingWF_{pipeline_mod}',
+                            content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                source=source,
+                                source_device=source_device,
+                                transaction_id=transaction_id,
+                                batch_name=batch_name,
+                                pipeline_mod=pipeline_mod,
+                                record_count="1",
+                                error=upload_row.image_upload_status,
+                                error_code="48",
+                                tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                event_name="TRImageUpload",
+                                file_path=upload_row.image_path
+                            )
+                        )
+                log.info("TR Image Upload: Complete")
 
             final_record_count = len(final_pdf[final_pdf.tr_load_status == "Ref Fields Updated"])
             log.info(f"Records in the LoadData Module that got loaded: {final_record_count}")
