@@ -492,34 +492,49 @@ def upload_image_to_tr(center_id, item_code, file_name, file_bytes, tr_access_to
 def process_image_upload(row, incoming_bucket, tr_access_token):
     # Skip if TR creation/update wasn't successful
     if row.get('tr_load_status') != "Ref Fields Updated":
-        return "Skipped: TR Item not successfully created/updated"
+        return [{"file_path": "", "status": "Skipped: TR Item not successfully created/updated"}]
 
     item_code_id = row.get('ItemCodeID')
     item_code = row.get('ItemCode')
-    image_path = row.get('image_path')
+    image_paths_raw = row.get('image_path')
 
-    if not item_code_id or not item_code or not image_path:
-        return "Error: Missing required fields for image upload"
+    if not item_code_id or not item_code or not image_paths_raw:
+        return [{"file_path": "", "status": "Error: Missing required fields for image upload"}]
+
+    results = []
+
+    # Split by comma in case there are multiple images
+    image_paths = [p.strip() for p in str(image_paths_raw).split(',') if p.strip()]
+
+    if not image_paths:
+         return [{"file_path": "", "status": "Error: No valid image paths found after split"}]
 
     try:
         # Get CenterID
         center_id = get_tr_center_id(item_code_id, tr_access_token)
         if center_id is None:
-            return "Error: Could not retrieve CenterID"
+            return [{"file_path": p, "status": "Error: Could not retrieve CenterID"} for p in image_paths]
 
-        # Download S3 file
-        response = s3_client.get_object(Bucket=incoming_bucket, Key=image_path)
-        file_bytes = list(response['Body'].read())
+        for single_image_path in image_paths:
+            try:
+                # Download S3 file
+                response = s3_client.get_object(Bucket=incoming_bucket, Key=single_image_path)
+                file_bytes = list(response['Body'].read())
 
-        # Extract filename
-        file_name = image_path.split('/')[-1]
+                # Extract filename
+                file_name = single_image_path.split('/')[-1]
 
-        # Base64 encode file_bytes if needed, but requirements imply standard json list of bytes
-        # or string. We use the list of bytes per acceptance/description.
-        return upload_image_to_tr(center_id, item_code, file_name, file_bytes, tr_access_token)
+                # Upload to TR
+                status = upload_image_to_tr(center_id, item_code, file_name, file_bytes, tr_access_token)
+                results.append({"file_path": single_image_path, "status": status})
+            except Exception as inner_e:
+                log.error(f"Error processing image upload for single file {single_image_path}: {inner_e}")
+                results.append({"file_path": single_image_path, "status": f"Exception: {inner_e}"})
+
+        return results
     except Exception as e:
-        log.error(f"Error processing image upload for {image_path}: {e}")
-        return f"Exception: {e}"
+        log.error(f"Error processing image upload for {image_paths_raw}: {e}")
+        return [{"file_path": p, "status": f"Exception: {e}"} for p in image_paths]
 
 
 def update_item_refs(row):
@@ -1267,47 +1282,51 @@ def main(**kwargs):
                             if upload_row.tr_load_status != "Ref Fields Updated":
                                 continue
 
-                            if upload_row.image_upload_status == "File Uploaded":
-                                total_files_uploaded += 1
-                                Onboarding_Timestream_Manager.timestream_insert_data(
-                                    db=args["TimestreamDB"],
-                                    table=args["TimestreamTable"],
-                                    timestream_queue=args["TimestreamSQSQueue"],
-                                    measure_name=f'OnboardingWF_{pipeline_mod}',
-                                    content=Onboarding_Timestream_Manager.create_timestream_content(
-                                        source=source,
-                                        source_device=source_device,
-                                        transaction_id=transaction_id,
-                                        batch_name=batch_name,
-                                        pipeline_mod=pipeline_mod,
-                                        state="Complete",
-                                        no_of_asset="1",
-                                        item_code=upload_row.ItemCode,
-                                        file_path=upload_row.image_path,
-                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                        event_name="TRImageUpload"
+                            for upload_result in upload_row.image_upload_status:
+                                single_status = upload_result.get("status")
+                                single_file_path = upload_result.get("file_path") or upload_row.image_path
+
+                                if single_status == "File Uploaded":
+                                    total_files_uploaded += 1
+                                    Onboarding_Timestream_Manager.timestream_insert_data(
+                                        db=args["TimestreamDB"],
+                                        table=args["TimestreamTable"],
+                                        timestream_queue=args["TimestreamSQSQueue"],
+                                        measure_name=f'OnboardingWF_{pipeline_mod}',
+                                        content=Onboarding_Timestream_Manager.create_timestream_content(
+                                            source=source,
+                                            source_device=source_device,
+                                            transaction_id=transaction_id,
+                                            batch_name=batch_name,
+                                            pipeline_mod=pipeline_mod,
+                                            state="Complete",
+                                            no_of_asset="1",
+                                            item_code=upload_row.ItemCode,
+                                            file_path=single_file_path,
+                                            tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                            event_name="TRImageUpload"
+                                        )
                                     )
-                                )
-                            else:
-                                Onboarding_Timestream_Manager.timestream_insert_data(
-                                    db=args["TimestreamDB"],
-                                    table=args["TimestreamTable"],
-                                    timestream_queue=args["TimestreamSQSQueue"],
-                                    measure_name=f'OnboardingWF_{pipeline_mod}',
-                                    content=Onboarding_Timestream_Manager.create_timestream_failure_content(
-                                        source=source,
-                                        source_device=source_device,
-                                        transaction_id=transaction_id,
-                                        batch_name=batch_name,
-                                        pipeline_mod=pipeline_mod,
-                                        record_count="1",
-                                        error=upload_row.image_upload_status,
-                                        error_code="48",
-                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                        event_name="TRImageUpload",
-                                        file_path=upload_row.image_path
+                                else:
+                                    Onboarding_Timestream_Manager.timestream_insert_data(
+                                        db=args["TimestreamDB"],
+                                        table=args["TimestreamTable"],
+                                        timestream_queue=args["TimestreamSQSQueue"],
+                                        measure_name=f'OnboardingWF_{pipeline_mod}',
+                                        content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                            source=source,
+                                            source_device=source_device,
+                                            transaction_id=transaction_id,
+                                            batch_name=batch_name,
+                                            pipeline_mod=pipeline_mod,
+                                            record_count="1",
+                                            error=single_status,
+                                            error_code="48",
+                                            tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                            event_name="TRImageUpload",
+                                            file_path=single_file_path
+                                        )
                                     )
-                                )
 
                         Onboarding_Timestream_Manager.timestream_insert_data(
                             db=args["TimestreamDB"],
@@ -1872,47 +1891,51 @@ def main(**kwargs):
                             if upload_row.tr_load_status != "Ref Fields Updated":
                                 continue
 
-                            if upload_row.image_upload_status == "File Uploaded":
-                                total_files_uploaded += 1
-                                Onboarding_Timestream_Manager.timestream_insert_data(
-                                    db=args["TimestreamDB"],
-                                    table=args["TimestreamTable"],
-                                    timestream_queue=args["TimestreamSQSQueue"],
-                                    measure_name=f'OnboardingWF_{pipeline_mod}',
-                                    content=Onboarding_Timestream_Manager.create_timestream_content(
-                                        source=source,
-                                        source_device=source_device,
-                                        transaction_id=transaction_id,
-                                        batch_name=batch_name,
-                                        pipeline_mod=pipeline_mod,
-                                        state="Complete",
-                                        no_of_asset="1",
-                                        item_code=upload_row.ItemCode,
-                                        file_path=upload_row.image_path,
-                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                        event_name="TRImageUpload"
+                            for upload_result in upload_row.image_upload_status:
+                                single_status = upload_result.get("status")
+                                single_file_path = upload_result.get("file_path") or upload_row.image_path
+
+                                if single_status == "File Uploaded":
+                                    total_files_uploaded += 1
+                                    Onboarding_Timestream_Manager.timestream_insert_data(
+                                        db=args["TimestreamDB"],
+                                        table=args["TimestreamTable"],
+                                        timestream_queue=args["TimestreamSQSQueue"],
+                                        measure_name=f'OnboardingWF_{pipeline_mod}',
+                                        content=Onboarding_Timestream_Manager.create_timestream_content(
+                                            source=source,
+                                            source_device=source_device,
+                                            transaction_id=transaction_id,
+                                            batch_name=batch_name,
+                                            pipeline_mod=pipeline_mod,
+                                            state="Complete",
+                                            no_of_asset="1",
+                                            item_code=upload_row.ItemCode,
+                                            file_path=single_file_path,
+                                            tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                            event_name="TRImageUpload"
+                                        )
                                     )
-                                )
-                            else:
-                                Onboarding_Timestream_Manager.timestream_insert_data(
-                                    db=args["TimestreamDB"],
-                                    table=args["TimestreamTable"],
-                                    timestream_queue=args["TimestreamSQSQueue"],
-                                    measure_name=f'OnboardingWF_{pipeline_mod}',
-                                    content=Onboarding_Timestream_Manager.create_timestream_failure_content(
-                                        source=source,
-                                        source_device=source_device,
-                                        transaction_id=transaction_id,
-                                        batch_name=batch_name,
-                                        pipeline_mod=pipeline_mod,
-                                        record_count="1",
-                                        error=upload_row.image_upload_status,
-                                        error_code="48",
-                                        tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                        event_name="TRImageUpload",
-                                        file_path=upload_row.image_path
+                                else:
+                                    Onboarding_Timestream_Manager.timestream_insert_data(
+                                        db=args["TimestreamDB"],
+                                        table=args["TimestreamTable"],
+                                        timestream_queue=args["TimestreamSQSQueue"],
+                                        measure_name=f'OnboardingWF_{pipeline_mod}',
+                                        content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                            source=source,
+                                            source_device=source_device,
+                                            transaction_id=transaction_id,
+                                            batch_name=batch_name,
+                                            pipeline_mod=pipeline_mod,
+                                            record_count="1",
+                                            error=single_status,
+                                            error_code="48",
+                                            tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                            event_name="TRImageUpload",
+                                            file_path=single_file_path
+                                        )
                                     )
-                                )
 
                         Onboarding_Timestream_Manager.timestream_insert_data(
                             db=args["TimestreamDB"],
@@ -2071,47 +2094,51 @@ def main(**kwargs):
                     if upload_row.tr_load_status != "Ref Fields Updated":
                         continue
 
-                    if upload_row.image_upload_status == "File Uploaded":
-                        total_files_uploaded += 1
-                        Onboarding_Timestream_Manager.timestream_insert_data(
-                            db=args["TimestreamDB"],
-                            table=args["TimestreamTable"],
-                            timestream_queue=args["TimestreamSQSQueue"],
-                            measure_name=f'OnboardingWF_{pipeline_mod}',
-                            content=Onboarding_Timestream_Manager.create_timestream_content(
-                                source=source,
-                                source_device=source_device,
-                                transaction_id=transaction_id,
-                                batch_name=batch_name,
-                                pipeline_mod=pipeline_mod,
-                                state="Complete",
-                                no_of_asset="1",
-                                item_code=upload_row.item_code,
-                                file_path=upload_row.image_path,
-                                tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                event_name="TRImageUpload"
+                    for upload_result in upload_row.image_upload_status:
+                        single_status = upload_result.get("status")
+                        single_file_path = upload_result.get("file_path") or upload_row.image_path
+
+                        if single_status == "File Uploaded":
+                            total_files_uploaded += 1
+                            Onboarding_Timestream_Manager.timestream_insert_data(
+                                db=args["TimestreamDB"],
+                                table=args["TimestreamTable"],
+                                timestream_queue=args["TimestreamSQSQueue"],
+                                measure_name=f'OnboardingWF_{pipeline_mod}',
+                                content=Onboarding_Timestream_Manager.create_timestream_content(
+                                    source=source,
+                                    source_device=source_device,
+                                    transaction_id=transaction_id,
+                                    batch_name=batch_name,
+                                    pipeline_mod=pipeline_mod,
+                                    state="Complete",
+                                    no_of_asset="1",
+                                    item_code=upload_row.item_code,
+                                    file_path=single_file_path,
+                                    tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                    event_name="TRImageUpload"
+                                )
                             )
-                        )
-                    else:
-                        Onboarding_Timestream_Manager.timestream_insert_data(
-                            db=args["TimestreamDB"],
-                            table=args["TimestreamTable"],
-                            timestream_queue=args["TimestreamSQSQueue"],
-                            measure_name=f'OnboardingWF_{pipeline_mod}',
-                            content=Onboarding_Timestream_Manager.create_timestream_failure_content(
-                                source=source,
-                                source_device=source_device,
-                                transaction_id=transaction_id,
-                                batch_name=batch_name,
-                                pipeline_mod=pipeline_mod,
-                                record_count="1",
-                                error=upload_row.image_upload_status,
-                                error_code="48",
-                                tr_account_name=tr_account_name if tr_account_name is not None else '-',
-                                event_name="TRImageUpload",
-                                file_path=upload_row.image_path
+                        else:
+                            Onboarding_Timestream_Manager.timestream_insert_data(
+                                db=args["TimestreamDB"],
+                                table=args["TimestreamTable"],
+                                timestream_queue=args["TimestreamSQSQueue"],
+                                measure_name=f'OnboardingWF_{pipeline_mod}',
+                                content=Onboarding_Timestream_Manager.create_timestream_failure_content(
+                                    source=source,
+                                    source_device=source_device,
+                                    transaction_id=transaction_id,
+                                    batch_name=batch_name,
+                                    pipeline_mod=pipeline_mod,
+                                    record_count="1",
+                                    error=single_status,
+                                    error_code="48",
+                                    tr_account_name=tr_account_name if tr_account_name is not None else '-',
+                                    event_name="TRImageUpload",
+                                    file_path=single_file_path
+                                )
                             )
-                        )
 
                         Onboarding_Timestream_Manager.timestream_insert_data(
                             db=args["TimestreamDB"],
